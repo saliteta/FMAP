@@ -4,6 +4,105 @@
 
 ---
 
+## 0. Current status and quickstart
+
+Implemented so far: the **reference view graph** (Stage 0) with an interactive viewer, and a first **VGGT batch-overlap** experiment (Stages 1–2), evaluated against the reference. Everything from §1 onward is the design that the remaining work follows.
+
+### Setup
+
+```bash
+git clone --recursive https://github.com/saliteta/FMAP.git   # VGGT is a submodule in third_party/vggt
+cd FMAP
+conda create -n fgsfm python=3.11 -y && conda activate fgsfm
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+pip install -r requirements.txt
+```
+
+VGGT weights (`facebook/VGGT-1B`, ~5 GB) download on first use. Check the checkpoint license before commercial use.
+
+### Data
+
+Scenes follow the GauUscene layout (`<scene>/colmap_metrics/`):
+
+| Path | Content |
+|---|---|
+| `sparse/0/cameras.txt`, `images.txt` | COLMAP poses + intrinsics (PINHOLE); `images.txt` has **no** 2D points |
+| `sparse/0/points3D.ply` | tie points in the COLMAP frame (`points3D.txt` is empty) |
+| `AT-export.xml` | ContextCapture BlocksExchange AT export: tie points **with their observing photos** (the tracks) |
+| `images/` | full-resolution JPEGs (5472×3648) |
+
+Tie point *k* in `AT-export.xml` is point *k* of `points3D.ply`, offset by `SRSOrigin` in `metadata.xml`. Reference covisibility therefore comes from the AT tracks.
+
+### 1. Reference view graph viewer (COLMAP)
+
+```bash
+python scripts/view_covisibility.py --scene /mnt/z/Dataset/GauUscene/GauUsceneDepth/HAV/colmap_metrics
+# open http://localhost:8080
+```
+
+Click a camera frustum (or use the slider): it turns green, and every other camera is colored **red (high overlap) → blue (no overlap)**. Panel options: score type (`overlap` = shared points / min points, `jaccard`, `shared`), color scale, hide uncorrelated, top-k links, highlight the selected camera's tie points, `--thumbnails` for images in frustums.
+
+### 2. VGGT batch overlap and evaluation
+
+```bash
+SCENE=/mnt/z/Dataset/GauUscene/GauUsceneDepth/HAV/colmap_metrics
+python scripts/cache_images.py      --scene $SCENE --width 518            # one-time, local 518-px copies
+python scripts/run_vggt_overlap.py  --scene $SCENE --batch-size 24 --coverage 2 --num-random 15 --out runs/HAV_vggt
+python scripts/eval_vggt_overlap.py --scene $SCENE --run runs/HAV_vggt   # metrics.json + figures/
+python scripts/view_covisibility.py --scene $SCENE --vggt-run runs/HAV_vggt  # adds 'vggt' and 'footprint' scores
+```
+
+- **Batches**: spatial kNN batches around farthest-point seeds (a stand-in for GPS; every camera in ≥ `--coverage` batches) plus random batches that probe false positives.
+- **VGGT overlap** per batch, by depth reprojection: confident pixels of *i* are lifted with predicted depth and pose, then projected into *j*. A pixel counts if it lands inside *j* with consistent depth. `O_ij = min(covis_i→j, covis_j→i)`. This is *derived* evidence (§3): it scores and proposes edges but never verifies them. Pairs in several batches are averaged; pairs never co-batched are NaN and shown gray in the viewer.
+- **References**: (a) shared AT tie points, positive at ≥ 30 shared points; (b) a track-free **footprint** overlap that casts reference-pose rays onto the ground plane, positive at ≥ 0.1.
+- **Baseline**: camera-center distance (GPS proxy; uses reference centers, so optimistic).
+
+### First results — HAV (424 images, 86% are 45° oblique)
+
+76 batches × 24 images: 1.5 s/batch and 8.4 GB peak VRAM on an RTX 4090 (bf16). 12,505 of 89,676 pairs evaluated.
+
+| Metric (all evaluated pairs) | VGGT overlap | Camera distance |
+|---|---|---|
+| Spearman ρ vs tie-point overlap | 0.88 | – |
+| AP, tie-point reference | 0.83 | 0.66 |
+| AP, footprint reference | 0.96 | 0.65 |
+| Recall @ precision 0.98, footprint reference | 0.81 | 0.00 |
+
+| Relative pose, spatial batches, covisible pairs | |
+|---|---|
+| Median rotation / translation-direction error | 0.69° / 2.6° |
+| RRA@5° / RTA@5° | 0.98 / 0.69 |
+
+Findings:
+- **Most "false positives" are missing tie points, not VGGT errors.** 561 pairs have VGGT ≥ 0.3 but < 30 shared tie points. 99% of them have footprint overlap ≥ 0.2, and the gallery shows the same terrain seen from opposite oblique directions.
+- **VGGT misses come from failed batches.** 17 of 76 batches (15 random, 2 spatial) have median rotation error > 5°. The batch's median depth confidence separates them perfectly on this scene (threshold ≈ 5.9, ROC-AUC 1.0). This is a candidate verifier signal, still to be confirmed on other scenes.
+- **Camera distance is a weak proposer on oblique blocks**: co-located cameras looking in different directions don't overlap.
+
+Figures in `runs/<run>/figures/`: VGGT vs reference scatter plots, PR curves, overlap matrices in flight order, rotation error vs covisibility, disagreement gallery.
+
+### Code map (implemented)
+
+| Module | Content |
+|---|---|
+| `fgsfm/core/camera.py` | `CameraNode`: optional pose, intrinsics, live `connections` row |
+| `fgsfm/graph/view_graph.py` | `ViewGraph`: dense N×N scores starting at zero, `update_pair`, `set_all`, `edges`, `top_k` |
+| `fgsfm/graph/covisibility.py` | shared-track counts → overlap / jaccard |
+| `fgsfm/graph/footprint.py` | ground-plane footprint overlap from poses |
+| `fgsfm/io/` | COLMAP text + PLY reader, `AT-export.xml` tie-point reader (cached), scene loader |
+| `fgsfm/fm/backbones/vggt_adapter.py` | `VGGTAdapter.infer` → poses, intrinsics, depth, confidence |
+| `fgsfm/fm/overlap.py` | batch depth-reprojection overlap |
+| `fgsfm/proposal/batches.py` | spatial kNN and random batches |
+| `fgsfm/eval/overlap_metrics.py` | Spearman, PR/AP/ROC, relative-pose errors, AUC |
+| `fgsfm/viz/covisibility_viewer.py` | viser viewer (any N×N score matrix) |
+
+### Next
+
+- Run on the other GauUscene scenes (CUHK_LOWER/UPPER, LFLS, SMBU, SZIIT, SZTU) to check that the findings hold.
+- Use the VGGT track head as *independent* evidence for edge verification.
+- Grow the graph from VGGT-predicted overlap instead of reference-pose batching (Stage 3), and gate batches by confidence.
+
+---
+
 ## 1. Motivation
 
 The current gold standard (COLMAP / GLOMAP + manual fixes → MVS or 3DGS) is:
@@ -118,7 +217,7 @@ The **evaluation harness (Stage 0)** and **backbone benchmark (Stage 1)** come f
 
 ---
 
-## 5. Repository layout
+## 5. Repository layout (target; see §0 for what exists today)
 
 ```
 fgsfm/
@@ -320,7 +419,7 @@ Targets marked *(initial)* are starting points to be revised after the first pil
 - [ ] Conversion of GPS to a local ENU frame; record per-image GNSS covariance.
 - [ ] Undistortion using EXIF / calibration; keep the real camera model for BA.
 - [ ] Reference builder: scripted COLMAP 4.x run (incremental and global) with pose priors; store as `reference/`.
-- [ ] Reference covisibility graph from the reference reconstruction.
+- [x] Reference covisibility graph from the reference reconstruction (shared AT tie points; `fgsfm/graph/covisibility.py`).
 - [ ] Metrics library implementing §8 with unit tests on synthetic scenes (known poses, injected noise).
 - [ ] Run registry: config hash, git commit, hardware info, timings.
 - [ ] Report generator: one HTML/Markdown report per run, and a comparison report across runs.

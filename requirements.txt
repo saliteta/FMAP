@@ -4,3 +4,13 @@ scipy
 plyfile
 pillow
 viser>=1.1
+
+# VGGT batch overlap (third_party/vggt submodule; weights: facebook/VGGT-1B)
+torch
+torchvision
+einops
+huggingface_hub
+safetensors
+opencv-python-headless
+matplotlib
+tqdm

@@ -30,6 +30,8 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--thumbnails", action="store_true", help="draw image thumbnails in frustums (slower start)")
     ap.add_argument("--frustum-scale", type=float, default=None)
+    ap.add_argument("--vggt-run", type=Path, default=None,
+                    help="run dir from run_vggt_overlap.py; adds 'vggt' (and 'footprint' if evaluated) scores")
     ap.add_argument("--save-graph", type=Path, default=None, help="write overlap scores to .npz")
     args = ap.parse_args()
 
@@ -46,6 +48,10 @@ def main():
     pts_by_img = [scene.obs_point[order[bounds[i]:bounds[i + 1]]] for i in range(len(g))]
 
     score_fns = {k: (lambda k=k: scene.scores(k)) for k in SCORE_TYPES}
+    if args.vggt_run is not None:
+        score_fns["vggt"] = lambda: np.load(args.vggt_run / "vggt_overlap.npz")["overlap"]
+        if (args.vggt_run / "footprint_overlap.npy").exists():
+            score_fns["footprint"] = lambda: np.load(args.vggt_run / "footprint_overlap.npy")
 
     viewer = CovisibilityViewer(
         g, score_fns,

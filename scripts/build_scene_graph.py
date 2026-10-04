@@ -3,7 +3,11 @@
     python scripts/build_scene_graph.py --scene /mnt/z/.../HAV/colmap_metrics --out runs/HAV_graph
 
 The reference (COLMAP poses, tie points, footprint overlap) is used ONLY for evaluation.
-Outputs: <out>/graph.npz, <out>/metrics.json, <out>/log.json
+Outputs: <out>/graph.npz, <out>/metrics.json, <out>/log.json, and checkpoints in <out>/ckpt/:
+  sweep.pkl, origin.pkl, round_XX.pkl, latest.pkl (+ *_node_status.json per checkpoint).
+Resume (skips finished stages; config flags given now apply):
+    python scripts/build_scene_graph.py --scene ... --out runs/HAV_graph_v6 --resume runs/HAV_graph_v6/ckpt/latest.pkl
+    python scripts/build_scene_graph.py --scene ... --out runs/try --resume runs/HAV_graph_v6/ckpt/origin.pkl --max-rounds 5
 """
 from __future__ import annotations
 
@@ -83,6 +87,11 @@ def main():
     ap.add_argument("--scene", type=Path, required=True)
     ap.add_argument("--image-dir", type=Path, default=None)
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--ckpt-dir", type=Path, default=None, help="default: <out>/ckpt")
+    ap.add_argument("--resume", type=Path, default=None,
+                    help="checkpoint .pkl to continue from (sweep/origin/round_XX/latest); CLI config applies")
+    ap.add_argument("--keep-round-ckpts", action=argparse.BooleanOptionalAction, default=True,
+                    help="keep round_XX.pkl for every round (otherwise only latest.pkl)")
     for f in dataclasses.fields(BuilderConfig):
         if isinstance(f.default, tuple):
             ap.add_argument(f"--{f.name.replace('_', '-')}", type=lambda v: tuple(int(x) for x in v.split(",")),
@@ -102,15 +111,41 @@ def main():
 
     t0 = time.time()
     b = GraphBuilder(paths, cfg)
-    metrics = dict(config=dataclasses.asdict(cfg), stages=[])
-    b.sweep()
-    metrics["stages"].append(evaluate(b, "sweep"))
-    b.choose_origin()
-    metrics["stages"].append(evaluate(b, "origin"))
-    rounds = b.grow(eval_fn=evaluate)
-    metrics["stages"] += [r["eval"] for r in rounds]
-    metrics["rounds"] = [{k: v for k, v in r.items() if k != "eval"} for r in rounds]
-    metrics["time"] = dict(total_s=time.time() - t0, inference_s=b.inference_time, batches=len(b.graph.batches))
+    b.eval_stages = []
+    ckpt_dir = args.ckpt_dir or args.out / "ckpt"
+    stage = "init"
+    if args.resume is not None:
+        stage = b.load_checkpoint(args.resume)
+        b.eval_stages = getattr(b, "eval_stages_saved", None) or []
+        print(f"resumed from {args.resume}: stage={stage}, next_round={b.next_round}, relax={b.relax}, "
+              f"seed={int((b.graph.frame_of == b.graph.seed_frame).sum())} cams", flush=True)
+
+    def checkpoint(name: str, st: str) -> None:
+        b.eval_stages_saved = b.eval_stages
+        b.save_checkpoint(ckpt_dir / f"{name}.pkl", st)
+        if name != "latest":
+            b.save_checkpoint(ckpt_dir / "latest.pkl", st)
+
+    if stage == "init":
+        b.sweep()
+        b.eval_stages.append(evaluate(b, "sweep"))
+        checkpoint("sweep", "sweep")
+        stage = "sweep"
+    if stage == "sweep":
+        b.choose_origin()
+        b.eval_stages.append(evaluate(b, "origin"))
+        checkpoint("origin", "origin")
+        stage = "origin"
+    if not b.finished:
+        def on_round_end(builder, r):
+            builder.eval_stages.append(builder.history[-1]["eval"])
+            checkpoint(f"round_{r:02d}" if args.keep_round_ckpts else "latest", "round")
+        b.grow(eval_fn=evaluate, on_round_end=on_round_end)
+
+    metrics = dict(config=dataclasses.asdict(cfg), stages=b.eval_stages,
+                   rounds=[{k: v for k, v in r.items() if k != "eval"} for r in b.history],
+                   resumed_from=str(args.resume) if args.resume else None)
+    metrics["time"] = dict(this_session_s=time.time() - t0, inference_s=b.inference_time, batches=len(b.graph.batches))
     print(json.dumps(metrics["time"]))
 
     args.out.mkdir(parents=True, exist_ok=True)

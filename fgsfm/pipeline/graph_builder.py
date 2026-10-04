@@ -95,6 +95,8 @@ class GraphBuilder:
         self.history: list[dict] = []
         self.next_round = 0
         self.finished = False
+        self.stage = "init"
+        self.eval_stages_saved: list = []
         self.inference_time = 0.0
         self.gate_rejects = 0
         self.pending_merges: dict[int, list] = {}
@@ -405,8 +407,9 @@ class GraphBuilder:
         self.missing_pairs = int(np.triu(miss).sum())
         return plans[: cfg.max_batches_per_round]
 
-    def grow(self, eval_fn=None) -> list[dict]:
-        """Growth rounds (round index, rng and history live on the builder)."""
+    def grow(self, eval_fn=None, on_round_end=None) -> list[dict]:
+        """Growth rounds; resumable (round index, rng, history live on the builder).
+        on_round_end(builder, round) is called after each round, e.g. to write a checkpoint."""
         g, cfg = self.graph, self.cfg
         rng, history = self.rng, self.history
         for r in range(self.next_round, cfg.max_rounds):
@@ -452,9 +455,71 @@ class GraphBuilder:
                           flush=True)
                     done = True
             self.finished = done
+            if on_round_end is not None:
+                on_round_end(self, r + 1)
             if done:
                 break
         return history
+
+    # ------------------------------------------------------------ checkpoints
+
+    _STATE = ("graph", "link_attempts", "relax", "abandoned", "pending_merges", "missing_pairs",
+              "inference_time", "rng", "history", "next_round", "finished", "stage", "eval_stages_saved")
+
+    def save_checkpoint(self, path: Path, stage: str) -> None:
+        """Pickle the full builder state (everything except the model) + write node_status.json beside it."""
+        import dataclasses
+        import pickle
+        self.stage = stage
+        state = {k: getattr(self, k) for k in self._STATE}
+        state["log_events"] = self.log.events
+        state["config"] = dataclasses.asdict(self.cfg)
+        state["image_paths"] = [str(p) for p in self.paths]
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "wb") as f:
+            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(path)
+        import json
+        (path.parent / f"{path.stem}_node_status.json").write_text(json.dumps(self.node_status(), indent=1))
+
+    def load_checkpoint(self, path: Path) -> str:
+        """Restore builder state; keeps the current config and model. Returns the checkpoint stage."""
+        import pickle
+        with open(path, "rb") as f:
+            state = pickle.load(f)
+        assert [Path(p).name for p in state["image_paths"]] == [p.name for p in self.paths], \
+            "checkpoint was built from a different image list"
+        for k in self._STATE:
+            setattr(self, k, state[k])
+        self.log.events = state["log_events"]
+        return self.stage
+
+    def node_status(self) -> dict:
+        g = self.graph
+        seed = g.seed_frame
+        others = sorted((f for f in set(g.frame_of.tolist()) if f >= 0 and f != seed),
+                        key=lambda f: -(g.frame_of == f).sum())
+        seg_name = {f: f"segment {k + 1}" for k, f in enumerate(others)}
+        nodes = []
+        for i, name in enumerate(g.names):
+            f = int(g.frame_of[i])
+            if self.abandoned[i]:
+                st = "abandoned"
+            elif f < 0:
+                st = "unregistered"
+            elif f == seed:
+                st = "seed"
+            else:
+                st = seg_name.get(f, "segment")
+            nodes.append(dict(id=i, name=name, status=st, frame=f, registered_by_batch=int(g.registered_by[i]),
+                              link_attempts=int(self.link_attempts[i]), origin=bool(i == g.origin)))
+        counts: dict[str, int] = {}
+        for nd in nodes:
+            counts[nd["status"]] = counts.get(nd["status"], 0) + 1
+        return dict(stage=self.stage, next_round=self.next_round, relax_level=self.relax,
+                    num_batches=len(g.batches), counts=counts, nodes=nodes)
 
     # ------------------------------------------------------------ BA
 

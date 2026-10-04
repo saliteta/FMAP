@@ -43,9 +43,15 @@ class CovisibilityViewer:
                  points_xyz: np.ndarray | None = None, points_rgb: np.ndarray | None = None,
                  points_of_image: Callable[[int], np.ndarray] | None = None,
                  port: int = 8080, frustum_scale: float | None = None,
-                 thumbnails: bool = False, max_points: int = 300_000):
+                 thumbnails: bool = False, max_points: int = 300_000,
+                 categories: np.ndarray | None = None, category_names: dict[int, str] | None = None,
+                 category_colors: dict[int, tuple[int, int, int]] | None = None):
+        """categories (optional): per-camera group id (e.g. segment) for the 'Color by: segment' mode."""
         self.graph = graph
         self.score_fns = score_fns
+        self.categories = categories
+        self.category_names = category_names or {}
+        self.category_colors = category_colors or {}
         self.score_cache: dict[str, np.ndarray] = {}
         self.points_of_image = points_of_image
         self.selected = 0
@@ -119,6 +125,8 @@ class CovisibilityViewer:
             self.gui_name = g.add_text("Name", initial_value="", disabled=True)
             self.gui_fly = g.add_button("Fly to camera")
         with g.add_folder("Scores"):
+            modes = ("segment", "score") if self.categories is not None else ("score",)
+            self.gui_color_by = g.add_dropdown("Color by", modes)
             self.gui_score = g.add_dropdown("Score", tuple(self.score_fns.keys()))
             self.gui_norm = g.add_dropdown("Color scale", ("relative to best", "absolute"))
             self.gui_gamma = g.add_slider("Gamma", min=0.2, max=2.0, step=0.05, initial_value=0.6)
@@ -133,7 +141,7 @@ class CovisibilityViewer:
         self.gui_image = g.add_image(np.zeros((8, 12, 3), np.uint8), label="Selected image")
 
         self.gui_cam.on_update(lambda _: self.select(int(self.gui_cam.value)))
-        for h in (self.gui_score, self.gui_norm, self.gui_gamma, self.gui_hide, self.gui_topk, self.gui_tie):
+        for h in (self.gui_color_by, self.gui_score, self.gui_norm, self.gui_gamma, self.gui_hide, self.gui_topk, self.gui_tie):
             h.on_update(lambda _: self.refresh())
         self.gui_scale.on_update(lambda _: self._set_scale(self.gui_scale.value))
         self.gui_points.on_update(lambda _: self._set_points_visible(self.gui_points.value))
@@ -174,6 +182,9 @@ class CovisibilityViewer:
         self.refresh()
 
     def refresh(self) -> None:
+        if self.gui_color_by.value == "segment":
+            self._refresh_segments()
+            return
         i = self.selected
         raw = self.scores()[i].astype(np.float64).copy()
         raw[i] = 0.0
@@ -207,6 +218,25 @@ class CovisibilityViewer:
             f"**Camera {i}** — {connected}/{len(s) - 1} cameras with score > 0"
             + (f", {int(unevaluated.sum())} not evaluated (gray)" if unevaluated.any() else "") + "\n\n"
             f"| id | {hdr} |\n|" + "---|" * (2 + len(others)) + f"\n{rows}")
+
+    def _refresh_segments(self) -> None:
+        i, cat = self.selected, self.categories
+        for j, fr in enumerate(self.frustums):
+            fr.color = SELECTED_RGB if j == i else self.category_colors.get(int(cat[j]), (120, 120, 120))
+            fr.visible = True
+        if self.lines is not None:
+            self.lines.remove()
+            self.lines = None
+        rows = []
+        for c in sorted(set(cat.tolist()), key=lambda c: -(cat == c).sum()):
+            members = np.flatnonzero(cat == c)
+            rgb = self.category_colors.get(int(c), (120, 120, 120))
+            sw = f'<span style="color:rgb{tuple(rgb)}">■</span>'
+            rows.append(f"| {sw} {self.category_names.get(int(c), c)} | {len(members)} | "
+                        f"{members.min()}–{members.max()} |")
+        name = self.category_names.get(int(cat[i]), cat[i])
+        self.gui_info.content = (f"**Camera {i}** is in **{name}**\n\n| segment | cameras | id range |\n|---|---|---|\n"
+                                 + "\n".join(rows))
 
     def _draw_links(self, i: int, s: np.ndarray, rgb: np.ndarray) -> None:
         if self.lines is not None:

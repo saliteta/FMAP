@@ -9,14 +9,27 @@ and proposing edges, never sufficient to verify one.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 
+@dataclass
+class BatchGeometry:
+    ys: torch.Tensor          # (P,) sampled pixel rows (model resolution)
+    xs: torch.Tensor          # (P,) sampled pixel cols
+    Xw: torch.Tensor          # (S, P, 3) lifted points in the batch frame
+    conf: torch.Tensor        # (S, P) depth confidence
+    valid: torch.Tensor       # (S, P) confident source pixels
+    hit: torch.Tensor         # (S_src, S_tgt, P) consistent reprojection into target
+    uv: torch.Tensor          # (S_src, S_tgt, P, 2) target pixel coords
+    covis: torch.Tensor       # (S, S) directional covisibility, row = source
+
+
 @torch.inference_mode()
-def reprojection_overlap(extrinsic: torch.Tensor, intrinsic: torch.Tensor, depth: torch.Tensor,
-                         conf: torch.Tensor, stride: int = 4, conf_quantile: float = 0.3,
-                         rel_depth_tol: float = 0.05) -> torch.Tensor:
-    """Returns (S, S) directional covisibility, row i = source image."""
+def batch_geometry(extrinsic: torch.Tensor, intrinsic: torch.Tensor, depth: torch.Tensor,
+                   conf: torch.Tensor, stride: int = 4, conf_quantile: float = 0.3,
+                   rel_depth_tol: float = 0.05) -> BatchGeometry:
     S, H, W = depth.shape
     dev = depth.device
     ys, xs = torch.meshgrid(torch.arange(0, H, stride, device=dev),
@@ -37,8 +50,8 @@ def reprojection_overlap(extrinsic: torch.Tensor, intrinsic: torch.Tensor, depth
     # project every source's points into every target: (S_src, S_tgt, P, 3)
     Xt = torch.einsum("tij,spj->stpi", R, Xw) + t[None, :, None]
     z = Xt[..., 2]
-    uv = torch.einsum("tij,stpj->stpi", intrinsic, Xt)
-    u, v = uv[..., 0] / z.clamp(min=1e-6), uv[..., 1] / z.clamp(min=1e-6)
+    uvw = torch.einsum("tij,stpj->stpi", intrinsic, Xt)
+    u, v = uvw[..., 0] / z.clamp(min=1e-6), uvw[..., 1] / z.clamp(min=1e-6)
     inside = (z > 0) & (u >= 0) & (u <= W - 1) & (v >= 0) & (v <= H - 1)
 
     ui = u.clamp(0, W - 1).round().long()
@@ -49,7 +62,13 @@ def reprojection_overlap(extrinsic: torch.Tensor, intrinsic: torch.Tensor, depth
 
     hit = inside & consistent & valid[:, None, :]
     covis = hit.sum(-1).float() / valid.sum(-1, keepdim=True).clamp(min=1).float()
-    return covis
+    return BatchGeometry(ys, xs, Xw, c, valid, hit, torch.stack([u, v], -1), covis)
+
+
+def reprojection_overlap(extrinsic, intrinsic, depth, conf, stride: int = 4, conf_quantile: float = 0.3,
+                         rel_depth_tol: float = 0.05) -> torch.Tensor:
+    """Returns (S, S) directional covisibility, row i = source image."""
+    return batch_geometry(extrinsic, intrinsic, depth, conf, stride, conf_quantile, rel_depth_tol).covis
 
 
 def symmetric_overlap(covis: torch.Tensor) -> torch.Tensor:

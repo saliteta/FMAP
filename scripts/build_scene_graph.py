@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fgsfm.eval.pose_metrics import pose_metrics
 from fgsfm.graph.footprint import footprint_overlap
+from fgsfm.io.gps import gps_enu_for
 from fgsfm.io.scene import load_reference_scene
 from fgsfm.pipeline.graph_builder import BuilderConfig, GraphBuilder
 
@@ -90,6 +91,9 @@ def main():
     ap.add_argument("--ckpt-dir", type=Path, default=None, help="default: <out>/ckpt")
     ap.add_argument("--resume", type=Path, default=None,
                     help="checkpoint .pkl to continue from (sweep/origin/round_XX/latest); CLI config applies")
+    ap.add_argument("--use-gps", action="store_true", help="use EXIF GPS from AT-export.xml as a position prior")
+    ap.add_argument("--gps-noise-m", type=float, default=0.0,
+                    help="add N(0, sigma) noise per axis to GPS (simulate consumer GNSS; HAV GPS is RTK-grade)")
     ap.add_argument("--keep-round-ckpts", action=argparse.BooleanOptionalAction, default=True,
                     help="keep round_XX.pkl for every round (otherwise only latest.pkl)")
     for f in dataclasses.fields(BuilderConfig):
@@ -109,8 +113,16 @@ def main():
     assert all(p.exists() for p in paths), f"missing cached images in {image_dir} (run scripts/cache_images.py)"
     evaluate = make_eval(scene, reference_footprint(scene))
 
+    gps = None
+    if args.use_gps:
+        gps, ok = gps_enu_for(names, args.scene / "AT-export.xml", cache=Path("runs/cache") / f"{scene_name}_gps.npz")
+        if args.gps_noise_m > 0:
+            gps = gps + np.random.default_rng(1).normal(scale=args.gps_noise_m, size=gps.shape)
+        print(f"GPS prior: {int(ok.sum())}/{len(names)} cameras, added noise sigma={args.gps_noise_m} m "
+              f"(note: ATE vs COLMAP is then not independent of the prior)", flush=True)
+
     t0 = time.time()
-    b = GraphBuilder(paths, cfg)
+    b = GraphBuilder(paths, cfg, gps_enu=gps)
     b.eval_stages = []
     ckpt_dir = args.ckpt_dir or args.out / "ckpt"
     stage = "init"
@@ -142,7 +154,8 @@ def main():
             checkpoint(f"round_{r:02d}" if args.keep_round_ckpts else "latest", "round")
         b.grow(eval_fn=evaluate, on_round_end=on_round_end)
 
-    metrics = dict(config=dataclasses.asdict(cfg), stages=b.eval_stages,
+    metrics = dict(config=dataclasses.asdict(cfg), use_gps=args.use_gps, gps_noise_m=args.gps_noise_m,
+                   gps_detached=b.gps_detached, stages=b.eval_stages,
                    rounds=[{k: v for k, v in r.items() if k != "eval"} for r in b.history],
                    resumed_from=str(args.resume) if args.resume else None)
     metrics["time"] = dict(this_session_s=time.time() - t0, inference_s=b.inference_time, batches=len(b.graph.batches))

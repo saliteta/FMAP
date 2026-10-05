@@ -86,6 +86,16 @@ def umeyama(src: np.ndarray, dst: np.ndarray, with_scale: bool = True) -> Sim3:
     return Sim3(s, R, mu_d - s * R @ mu_s)
 
 
+def robust_umeyama(src: np.ndarray, dst: np.ndarray, iters: int = 5, keep: float = 0.8) -> Sim3:
+    """Umeyama dst ≈ s R src + t with iterative trimming of the worst (1-keep) fraction."""
+    sim = umeyama(src, dst)
+    for _ in range(iters):
+        err = np.linalg.norm(sim.apply_points(src) - dst, axis=1)
+        sel = np.argsort(err)[: max(3, int(keep * len(err)))]
+        sim = umeyama(src[sel], dst[sel])
+    return sim
+
+
 @dataclass
 class Sim3Fit:
     sim3: Sim3

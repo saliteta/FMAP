@@ -3,18 +3,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from fgsfm.geometry.transforms import Sim3, centers, rotation_angle_deg, umeyama
+from fgsfm.geometry.transforms import Sim3, centers, robust_umeyama, rotation_angle_deg
 
 
 def robust_sim3_align(C_est: np.ndarray, C_ref: np.ndarray, iters: int = 5, keep: float = 0.8) -> Sim3:
     """Umeyama on camera centers with iterative trimming of the worst (1-keep) fraction."""
-    sel = np.arange(len(C_est))
-    sim = umeyama(C_est, C_ref)
-    for _ in range(iters):
-        err = np.linalg.norm(sim.apply_points(C_est) - C_ref, axis=1)
-        sel = np.argsort(err)[: max(3, int(keep * len(err)))]
-        sim = umeyama(C_est[sel], C_ref[sel])
-    return sim
+    return robust_umeyama(C_est, C_ref, iters, keep)
 
 
 def pose_metrics(w2c_est: np.ndarray, w2c_ref: np.ndarray, max_pairs: int = 50000, seed: int = 0) -> dict:

@@ -8,7 +8,10 @@ are thereby reconciled; refinement batches add the cross-strip constraints.
   over  R_c (axis-angle update), C_c, X_p;   origin camera fixed.
 
 The weak center prior fixes the remaining scale gauge and keeps cameras with
-few observations from drifting. Intrinsics stay at the FM prediction.
+few observations from drifting. With a position prior (GPS mapped into the
+frame), cameras with a target are pulled to it instead:
+    + w_t Σ_c ||C_c - G_c||² / σ_t²
+Intrinsics stay at the FM prediction.
 """
 from __future__ import annotations
 
@@ -46,6 +49,7 @@ class CoarseBAResult:
 def coarse_ba(w2c0: np.ndarray, K: np.ndarray, X0: np.ndarray, obs_cam: np.ndarray, obs_pt: np.ndarray,
               obs_uv: np.ndarray, fixed_cam: int, iters: int = 1500, huber_px: float = 2.0,
               prior_weight: float = 1e-2, lr: float = 2e-3, outlier_px: float = 12.0,
+              center_targets: np.ndarray | None = None, target_sigma: float = 1.0, target_weight: float = 1.0,
               device: str = "cuda") -> CoarseBAResult:
     """w2c0/K indexed by local camera id; obs_cam / obs_pt are local indices."""
     dt = torch.float64
@@ -64,6 +68,12 @@ def coarse_ba(w2c0: np.ndarray, K: np.ndarray, X0: np.ndarray, obs_cam: np.ndarr
     X0t = tt(X0)
     free = torch.ones(len(w2c0), 1, dtype=dt, device=device)
     free[fixed_cam] = 0.0
+    if center_targets is not None:
+        has_t = torch.as_tensor(np.isfinite(center_targets).all(1), device=device)
+        T = tt(np.nan_to_num(center_targets))
+    else:
+        has_t = torch.zeros(len(w2c0), dtype=torch.bool, device=device)
+        T = C0
 
     def residuals():
         R = _so3_exp(w * free) @ R0
@@ -90,7 +100,9 @@ def coarse_ba(w2c0: np.ndarray, K: np.ndarray, X0: np.ndarray, obs_cam: np.ndarr
         e = r[keep].norm(dim=1)
         hub = torch.where(e < huber_px, 0.5 * e ** 2, huber_px * (e - 0.5 * huber_px))
         prior = ((C - C0) / sigma).pow(2).sum(1)
-        loss = hub.mean() + prior_weight * prior.mean()
+        loss = hub.mean() + prior_weight * prior[~has_t].sum() / len(C)
+        if has_t.any():
+            loss = loss + target_weight * ((C[has_t] - T[has_t]) / target_sigma).pow(2).sum(1).mean()
         loss.backward()
         opt.step()
         sched.step()

@@ -35,7 +35,7 @@ from fgsfm.fm.backbones.vggt_adapter import VGGTAdapter
 from fgsfm.fm.coarse_ba import coarse_ba
 from fgsfm.fm.keypoints import select_keypoints
 from fgsfm.fm.overlap import batch_geometry, symmetric_overlap
-from fgsfm.geometry.transforms import Sim3, centers, fit_sim3_from_cameras, rotation_angle_deg, to4x4
+from fgsfm.geometry.transforms import Sim3, centers, fit_sim3_from_cameras, robust_umeyama, rotation_angle_deg, to4x4
 from fgsfm.graph.paths import max_product_paths, path_to
 from fgsfm.graph.scene_graph import BatchOutput, SceneGraph
 
@@ -67,6 +67,12 @@ class BuilderConfig:
     relax_merge_min_pairs: tuple = (2, 1, 1)
     relax_new_cam_min_inliers: tuple = (3, 2, 1)
     link_anchors: int = 6
+    # GPS prior (used only when the builder is given GPS positions)
+    gps_sigma_m: float = 2.0          # position prior std in coarse BA
+    gps_weight: float = 1.0
+    gps_outlier_m: float = 20.0       # seed camera this far from its GPS is detached and re-linked
+    gps_accept_m: float = 10.0        # merged / newly registered cameras must land within this of GPS
+    gps_link_radius_m: float = 200.0  # link anchors are chosen among seed cameras within this GPS radius
     max_link_attempts: int = 8
     ba_iters: int = 1500
 
@@ -82,8 +88,13 @@ class Log:
 
 class GraphBuilder:
     def __init__(self, image_paths: list[Path], cfg: BuilderConfig = BuilderConfig(),
-                 model: VGGTAdapter | None = None):
+                 model: VGGTAdapter | None = None, gps_enu: np.ndarray | None = None):
+        """gps_enu: optional (n, 3) camera positions in meters (local ENU); NaN rows = no GPS."""
         self.paths = image_paths
+        self.gps = gps_enu
+        self.gps_seed = None              # GPS mapped into the seed frame (refit every round)
+        self.gps_unit = 1.0               # seed-frame units per meter
+        self.gps_detached = 0
         self.cfg = cfg
         self.model = model or VGGTAdapter()
         self.graph: SceneGraph | None = None
@@ -235,6 +246,33 @@ class GraphBuilder:
 
     # ------------------------------------------------------------ 3. grow
 
+    # ------------------------------------------------------------ GPS prior
+
+    def _gps_update(self) -> dict:
+        """Map GPS into the seed frame (robust Sim(3) on seed cameras) and detach seed cameras whose
+        pose disagrees with their GPS by more than gps_outlier_m (they are re-linked later)."""
+        g, cfg = self.graph, self.cfg
+        cams = g.cams_in(g.seed_frame)
+        has = np.isfinite(self.gps[cams]).all(1)
+        if has.sum() < 3:
+            return dict(gps="too_few")
+        sim = robust_umeyama(self.gps[cams[has]], centers(g.w2c[cams[has]]))
+        self.gps_seed = np.where(np.isfinite(self.gps), sim.apply_points(np.nan_to_num(self.gps)), np.nan)
+        self.gps_unit = sim.s
+        dev_m = np.linalg.norm(centers(g.w2c[cams]) - self.gps_seed[cams], axis=1) / sim.s
+        out = cams[(dev_m > cfg.gps_outlier_m) & np.isfinite(dev_m) & (cams != g.origin)]
+        if len(out):
+            g.frame_of[out] = -1
+            self.link_attempts[out] = 0
+            self.abandoned[out] = False
+            self.gps_detached += len(out)
+            self.log(stage="grow", event="gps_detach", cameras=out.tolist())
+        return dict(gps_dev_median_m=float(np.nanmedian(dev_m)), gps_detached=int(len(out)))
+
+    def _gps_dev_m(self, w2c: np.ndarray, cams_global: np.ndarray) -> np.ndarray:
+        """Distance (m) between camera centers in the seed frame and their GPS."""
+        return np.linalg.norm(centers(w2c) - self.gps_seed[cams_global], axis=-1) / self.gps_unit
+
     def _integrate(self, b: BatchOutput, bid: int) -> str:
         """Register batch b into the seed frame (existing poses kept), merge segments, add keypoints."""
         g, seed, cfg = self.graph, self.graph.seed_frame, self.cfg
@@ -265,7 +303,16 @@ class GraphBuilder:
             k_min = self.p("merge_min_cams")
             fit2, good2 = self._fit(S.apply_w2c(b.w2c[gl]), g.w2c[idx[gl]], lr2, min_inliers=min(2, k_min))
             if good2 and fit2.num_inliers >= k_min:
-                if self._merge_confirmed(int(G), fit2.sim3, bid):
+                if self.gps_seed is not None:
+                    Gc = g.cams_in(G)
+                    dev = np.nanmedian(self._gps_dev_m(fit2.sim3.apply_w2c(g.w2c[Gc]), Gc))
+                    confirmed = bool(dev <= cfg.gps_accept_m)
+                    if not confirmed:
+                        result = "merge_gps_rejected"
+                        continue
+                else:
+                    confirmed = self._merge_confirmed(int(G), fit2.sim3, bid)
+                if confirmed:
                     size = len(g.cams_in(G))
                     g.transform_frame(int(G), fit2.sim3, new_frame=seed)
                     self.pending_merges.pop(int(G), None)
@@ -276,6 +323,9 @@ class GraphBuilder:
         # cameras with no pose at all: only from a well-anchored batch
         new = np.flatnonzero(ok & (g.frame_of[idx] == -1))
         new = self._connected(b, anc_in, new) if len(new) else new
+        if len(new) and self.gps_seed is not None:
+            dev = self._gps_dev_m(S.apply_w2c(b.w2c[new]), idx[new])
+            new = new[~(dev > cfg.gps_accept_m)]          # NaN (no GPS) passes
         if len(new) and fit.num_inliers >= self.p("new_cam_min_inliers"):
             g.register_batch(b, bid, seed, S, new, add_keypoints=False)
             result = "registered" if result == "updated" else result
@@ -304,6 +354,16 @@ class GraphBuilder:
         (adjacent captures; across strip turns these may look elsewhere, hence the mix).
         Retries rotate down the descriptor ranking."""
         g = self.graph
+        if self.gps_seed is not None and np.isfinite(self.gps_seed[qg]).all():
+            # GPS: seed cameras near the query, ranked by descriptor similarity (view direction)
+            d = np.linalg.norm(self.gps_seed[cams][:, None] - self.gps_seed[qg][None], axis=-1).min(1)
+            near = np.flatnonzero(d <= self.cfg.gps_link_radius_m * self.gps_unit)
+            if len(near) >= n_needed:
+                sim = (g.desc[qg] @ g.desc[cams[near]].T).max(0)
+                order = near[np.argsort(-sim)]
+                skip = int(self.link_attempts[qg].max()) * (n_needed // 2)
+                skip = skip % max(1, len(order) - n_needed + 1)
+                return [int(cams[k]) for k in order[skip:skip + n_needed]]
         seed_set = set(cams.tolist())
         seq = []
         for d in range(1, 4):
@@ -413,6 +473,7 @@ class GraphBuilder:
         g, cfg = self.graph, self.cfg
         rng, history = self.rng, self.history
         for r in range(self.next_round, cfg.max_rounds):
+            gps_info = self._gps_update() if self.gps is not None else {}
             size0, frames0 = int((g.frame_of == g.seed_frame).sum()), len(g.frames())
             plans = self.plan_round(rng)
             counts: dict[str, int] = {}
@@ -431,7 +492,7 @@ class GraphBuilder:
             size1, frames1 = int((g.frame_of == g.seed_frame).sum()), len(g.frames())
             rec = dict(round=r + 1, relax_level=self.relax, planned=len(plans), outcomes=counts,
                        seed_size=size1, segments=frames1, unregistered=int((g.frame_of < 0).sum()),
-                       missing_pairs=self.missing_pairs, overlap_gate_rejects=self.gate_rejects, ba=ba)
+                       missing_pairs=self.missing_pairs, overlap_gate_rejects=self.gate_rejects, ba=ba, **gps_info)
             if eval_fn is not None:
                 rec["eval"] = eval_fn(self, f"round{r + 1}")
             history.append(rec)
@@ -535,8 +596,12 @@ class GraphBuilder:
         m = nobs[obs_kp] >= 2
         if m.sum() < 100:
             return dict(skipped=True)
+        gps_kw = {}
+        if self.gps_seed is not None:
+            gps_kw = dict(center_targets=self.gps_seed[cams], target_sigma=self.cfg.gps_sigma_m * self.gps_unit,
+                          target_weight=self.cfg.gps_weight)
         res = coarse_ba(g.w2c[cams], g.K[cams], X, obs_cam[m], obs_kp[m], obs_uv[m],
-                        fixed_cam=int(loc[g.origin]), iters=self.cfg.ba_iters)
+                        fixed_cam=int(loc[g.origin]), iters=self.cfg.ba_iters, **gps_kw)
         g.w2c[cams] = res.w2c
         g.kp.scatter(seed, res.X)
         return dict(reproj_before_px=round(res.reproj_before_px, 3), reproj_after_px=round(res.reproj_after_px, 3),

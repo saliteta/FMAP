@@ -14,3 +14,10 @@ safetensors
 opencv-python-headless
 matplotlib
 tqdm
+
+# Global BA (scripts/run_global_ba.py) via third_party/InstantSfM (CC BY-NC 4.0) + bae.
+# Install WITHOUT dependency resolution so torch stays at the cu124 build:
+#   conda install -n fgsfm -c "nvidia/label/cuda-12.4.1" cuda-toolkit      # nvcc for bae's CUDA extensions
+#   pip install --no-deps "git+https://github.com/pypose/pypose.git"        # its deps would pin torch 2.0.1
+#   pip install pyceres warp-lang "nvidia-cudss-cu12==0.7.1.6"              # cuDSS 0.8 segfaults with bae at scale
+#   CUDA_HOME=$CONDA_PREFIX pip install --no-deps --no-build-isolation "git+https://github.com/sair-lab/bae.git"

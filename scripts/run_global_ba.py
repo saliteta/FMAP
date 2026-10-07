@@ -43,6 +43,9 @@ def main():
     ap.add_argument("--match-width", type=int, default=2736, help="SIFT image width (full res = 5472)")
     ap.add_argument("--max-features", type=int, default=8192)
     ap.add_argument("--pair-overlap", type=float, default=0.1, help="graph edges (measured or predicted) to match")
+    ap.add_argument("--topk", type=int, default=20, help="match top-K neighbours per image (0 = threshold mode)")
+    ap.add_argument("--sift-cache", type=Path, default=Path("runs/cache/sift"))
+    ap.add_argument("--topk-min-overlap", type=float, default=0.05)
     ap.add_argument("--init-reproj-px", type=float, default=64.0, help="triangulation filter with initial poses")
     ap.add_argument("--filter-px", type=str, default="16,8,4")
     ap.add_argument("--fix-intrinsics", action="store_true")
@@ -84,7 +87,7 @@ def main():
     # ---- features on the original images
     t = time.time()
     paths = [args.scene / "images" / names[c] for c in cams]
-    feats = extract_features(paths, Path("runs/cache") / "sift", args.match_width, args.max_features)
+    feats = extract_features(paths, args.sift_cache, args.match_width, args.max_features)
     T["features_s"] = time.time() - t
     print(f"features: median {int(np.median([len(f['xy']) for f in feats]))} per image ({T['features_s']:.0f}s)", flush=True)
 
@@ -92,10 +95,20 @@ def main():
     cams_p, O = g.predicted_overlap(g.seed_frame)
     assert (cams_p == cams).all()
     M = np.where(g.cobatched[np.ix_(cams, cams)], np.nan_to_num(g.measured[np.ix_(cams, cams)]), 0.0)
-    E = np.maximum(O, M) >= args.pair_overlap
-    np.fill_diagonal(E, False)
+    Sc = np.maximum(O, M)
+    np.fill_diagonal(Sc, 0.0)
+    if args.topk > 0:
+        # top-K predicted/measured neighbours per image (symmetrized), above a small floor
+        E = np.zeros_like(Sc, dtype=bool)
+        nn = np.argsort(-Sc, axis=1)[:, :args.topk]
+        E[np.repeat(np.arange(len(Sc)), args.topk), nn.ravel()] = True
+        E &= Sc >= args.topk_min_overlap
+        E |= E.T
+    else:
+        E = Sc >= args.pair_overlap
     pairs = [(int(i), int(j)) for i, j in zip(*np.nonzero(np.triu(E)))]
-    cache = args.out / f"tracks_w{args.match_width}_n{args.max_features}_o{args.pair_overlap}.pkl"
+    pair_tag = f"k{args.topk}" if args.topk > 0 else f"o{args.pair_overlap}"
+    cache = args.out / f"tracks_w{args.match_width}_n{args.max_features}_{pair_tag}.pkl"
     if cache.exists():
         with open(cache, "rb") as f:
             c = pickle.load(f)
@@ -144,8 +157,16 @@ def main():
     print(f"{'focal fx (ref ' + format(ref[0].K[0, 0], '.1f') + ')':<26}{K0[0, 0]:>22.1f}{out.K[0, 0]:>18.1f}")
     print(json.dumps(T))
 
+    # final tracks: flat observation table (track, local image, full-res pixel) for export / coloring
+    obs_trk = np.concatenate([np.full(len(o), t) for t, o in enumerate(out.tracks.obs_img)])
+    obs_img = np.concatenate(out.tracks.obs_img)
+    obs_xy = np.concatenate([feats[i]["xy"][f] for imgs, fts in zip(out.tracks.obs_img, out.tracks.obs_feat)
+                             for i, f in zip(imgs, fts)]).reshape(-1, 2)
     np.savez_compressed(args.out / "ba_result.npz", cams=cams, names=np.array([names[c] for c in cams]),
-                        w2c_init=w2c0, w2c=out.w2c, K_init=K0, K=out.K, points=out.tracks.xyz.astype(np.float32))
+                        w2c_init=w2c0, w2c=out.w2c, K_init=K0, K=out.K, image_wh=np.array([W, H]),
+                        points=out.tracks.xyz.astype(np.float32), obs_track=obs_trk.astype(np.int32),
+                        obs_image=obs_img.astype(np.int32), obs_xy=obs_xy.astype(np.float32),
+                        obs_per_image=np.bincount(obs_img, minlength=len(cams)))
     (args.out / "metrics.json").write_text(json.dumps(dict(
         ckpt=str(args.ckpt), use_gps=args.use_gps, match_width=args.match_width, pairs=len(pairs),
         verified_pairs=len(matches), tracks_initial=len(tracks), ba_stages=dict(reproj=out.reproj_px, tracks=out.num_tracks),

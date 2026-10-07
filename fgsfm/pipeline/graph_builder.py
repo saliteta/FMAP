@@ -74,7 +74,13 @@ class BuilderConfig:
     gps_accept_m: float = 10.0        # merged / newly registered cameras must land within this of GPS
     gps_link_radius_m: float = 200.0  # link anchors are chosen among seed cameras within this GPS radius
     max_link_attempts: int = 8
-    ba_iters: int = 1500
+    ba_iters: int = 300
+    coarse_ba: str = "final"         # "final" (default: one short pass with the GPS prior -> good positions
+                                     # for global BA) | "every_round" | "none"
+    # BEV linking (link_bev): anchors = nearest untried seed cameras on the GPS east/north map
+    bev_max_rings: int = 20          # give a group up after this many failed attempts
+    sweep_retry_window: int = 4      # unhealthy sweep windows are retried as 3 sub-windows of this size (0 = off)
+    dissolve_on_gps_reject: bool = True  # see _integrate
 
 
 @dataclass
@@ -107,6 +113,7 @@ class GraphBuilder:
         self.next_round = 0
         self.finished = False
         self.stage = "init"
+        self.bev_tried: dict = {}         # group key -> set of seed cameras already tried as anchors
         self.eval_stages_saved: list = []
         self.inference_time = 0.0
         self.gate_rejects = 0
@@ -187,39 +194,51 @@ class GraphBuilder:
         starts = list(range(0, max(n - w, 0) + 1, s))
         if starts[-1] + w < n:
             starts.append(n - w)
-        cur = None
-        for bid, st in enumerate(starts):
+        self._cur = None
+        for st in starts:
             idx = np.arange(st, min(st + w, n))
-            b = self.run_batch(idx, "sweep")
-            g = self.graph
-            g.batches.append(dict(idx=idx.tolist(), kind="sweep", health=b.health))
-            if not self.healthy(b):
-                self.log(stage="sweep", batch=bid, start=st, status="unhealthy", health=b.health)
-                continue
-            g.add_measurement(b)
-            ok_cams = np.flatnonzero(b.cam_conf >= self.cfg.min_cam_conf)
-            status = "new_segment"
-            if cur is not None:
-                anc = np.array([l for l in ok_cams if g.frame_of[idx[l]] == cur])
-                if len(anc) >= 2:
-                    lr = g.log_depth_ratios(idx[anc], b.depth[anc], b.valid[anc])
-                    fit, ok = self._fit(g.w2c[idx[anc]], b.w2c[anc], lr)
-                    if ok:
-                        # a window straddling a strip turn: cameras of the new view direction do not
-                        # overlap the anchors, so they are left for the next segment / linking
-                        new = np.array([l for l in ok_cams if g.frame_of[idx[l]] == -1], int)
-                        new = self._connected(b, anc[fit.inliers], new)
-                        g.register_batch(b, bid, cur, fit.sim3, new)
-                        status = "chained"
-            if status == "new_segment":
-                new = np.array([l for l in ok_cams if g.frame_of[idx[l]] == -1], int)
-                new = self._largest_component(b, new)
-                if len(new) >= 2:
-                    cur = g.new_frame()
-                    g.register_batch(b, bid, cur, Sim3.identity(), new)
-                else:
-                    status = "skipped"
-            self.log(stage="sweep", batch=bid, start=st, status=status, health=b.health, frame=cur)
+            if self._sweep_step(idx) == "unhealthy" and self.cfg.sweep_retry_window > 0:
+                # e.g. nadir strips: 8-image windows lose confidence while short windows stay fine
+                r = self.cfg.sweep_retry_window
+                for sub in sorted({0, (len(idx) - r) // 2, len(idx) - r}):
+                    self._sweep_step(idx[sub:sub + r], retry=True)
+
+    def _sweep_step(self, idx: np.ndarray, retry: bool = False) -> str:
+        """Run one sweep window and chain it to the current segment (or start a new one)."""
+        b = self.run_batch(idx, "sweep_retry" if retry else "sweep")
+        g = self.graph
+        bid = len(g.batches)
+        g.batches.append(dict(idx=idx.tolist(), kind="sweep_retry" if retry else "sweep", health=b.health))
+        st = int(idx[0])
+        if not self.healthy(b):
+            self.log(stage="sweep", batch=bid, start=st, size=len(idx), status="unhealthy", health=b.health)
+            return "unhealthy"
+        g.add_measurement(b)
+        ok_cams = np.flatnonzero(b.cam_conf >= self.cfg.min_cam_conf)
+        status = "new_segment"
+        cur = self._cur
+        if cur is not None:
+            anc = np.array([l for l in ok_cams if g.frame_of[idx[l]] == cur])
+            if len(anc) >= 2:
+                lr = g.log_depth_ratios(idx[anc], b.depth[anc], b.valid[anc])
+                fit, ok = self._fit(g.w2c[idx[anc]], b.w2c[anc], lr)
+                if ok:
+                    # a window straddling a strip turn: cameras of the new view direction do not
+                    # overlap the anchors, so they are left for the next segment / linking
+                    new = np.array([l for l in ok_cams if g.frame_of[idx[l]] == -1], int)
+                    new = self._connected(b, anc[fit.inliers], new)
+                    g.register_batch(b, bid, cur, fit.sim3, new)
+                    status = "chained"
+        if status == "new_segment":
+            new = np.array([l for l in ok_cams if g.frame_of[idx[l]] == -1], int)
+            new = self._largest_component(b, new)
+            if len(new) >= 2:
+                self._cur = g.new_frame()
+                g.register_batch(b, bid, self._cur, Sim3.identity(), new)
+            else:
+                status = "skipped"
+        self.log(stage="sweep", batch=bid, start=st, size=len(idx), status=status, health=b.health, frame=self._cur)
+        return status
 
     # ------------------------------------------------------------ 2. origin
 
@@ -248,7 +267,7 @@ class GraphBuilder:
 
     # ------------------------------------------------------------ GPS prior
 
-    def _gps_update(self) -> dict:
+    def _gps_update(self, detach: bool = True) -> dict:
         """Map GPS into the seed frame (robust Sim(3) on seed cameras) and detach seed cameras whose
         pose disagrees with their GPS by more than gps_outlier_m (they are re-linked later)."""
         g, cfg = self.graph, self.cfg
@@ -260,7 +279,7 @@ class GraphBuilder:
         self.gps_seed = np.where(np.isfinite(self.gps), sim.apply_points(np.nan_to_num(self.gps)), np.nan)
         self.gps_unit = sim.s
         dev_m = np.linalg.norm(centers(g.w2c[cams]) - self.gps_seed[cams], axis=1) / sim.s
-        out = cams[(dev_m > cfg.gps_outlier_m) & np.isfinite(dev_m) & (cams != g.origin)]
+        out = cams[(dev_m > cfg.gps_outlier_m) & np.isfinite(dev_m) & (cams != g.origin)] if detach else cams[:0]
         if len(out):
             g.frame_of[out] = -1
             self.link_attempts[out] = 0
@@ -309,6 +328,17 @@ class GraphBuilder:
                     confirmed = bool(dev <= cfg.gps_accept_m)
                     if not confirmed:
                         result = "merge_gps_rejected"
+                        # The segment's own VGGT geometry is distorted (its ends miss GPS) although this
+                        # batch places its cameras correctly: dissolve the segment; the cameras this batch
+                        # places well register below as new cameras, the rest link one by one later.
+                        placed = self._gps_dev_m(S.apply_w2c(b.w2c[gl]), idx[gl]) <= cfg.gps_accept_m
+                        if cfg.dissolve_on_gps_reject and placed.any():
+                            g.frame_of[Gc] = -1
+                            self.abandoned[Gc] = False
+                            self.link_attempts[Gc] = 0
+                            self.log(stage="grow", event="dissolve", batch=bid, frame=int(G), cameras=Gc.tolist(),
+                                     placed_by_batch=idx[gl][placed].tolist())
+                            result = "dissolved"
                         continue
                 else:
                     confirmed = self._merge_confirmed(int(G), fit2.sim3, bid)
@@ -488,7 +518,7 @@ class GraphBuilder:
                 g.add_measurement(b)
                 res = self._integrate(b, bid)
                 counts[f"{kind}:{res}"] = counts.get(f"{kind}:{res}", 0) + 1
-            ba = self.bundle_adjust()
+            ba = self.bundle_adjust() if cfg.coarse_ba == "every_round" else {}
             size1, frames1 = int((g.frame_of == g.seed_frame).sum()), len(g.frames())
             rec = dict(round=r + 1, relax_level=self.relax, planned=len(plans), outcomes=counts,
                        seed_size=size1, segments=frames1, unregistered=int((g.frame_of < 0).sum()),
@@ -520,12 +550,105 @@ class GraphBuilder:
                 on_round_end(self, r + 1)
             if done:
                 break
+        if cfg.coarse_ba == "final":
+            if self.gps is not None:
+                self._gps_update(detach=False)   # map GPS onto the final seed frame for the BA prior
+            self.history.append(dict(final_ba=self.bundle_adjust()))
+        return history
+
+    # ------------------------------------------------------------ BEV linking (fast mode)
+
+    def _bev_groups(self) -> list[tuple[tuple, np.ndarray]]:
+        """Groups outside the seed: per segment, the 3 consecutive cameras nearest (BEV) to the seed;
+        per run of unregistered cameras, consecutive pairs."""
+        g = self.graph
+        bev = self.gps[:, :2]
+        seed_xy = bev[g.cams_in(g.seed_frame)]
+        dist_to_seed = np.linalg.norm(bev[:, None] - seed_xy[None], axis=-1).min(1)
+        groups = []
+        for f in np.unique(g.frame_of):
+            if f == g.seed_frame or f < 0:
+                continue
+            members = np.sort(g.cams_in(f))
+            members = members[~self.abandoned[members]]
+            if len(members) == 0:
+                continue
+            k = min(3, len(members))
+            starts = np.arange(len(members) - k + 1)
+            best = starts[np.argmin([dist_to_seed[members[s:s + k]].mean() for s in starts])]
+            groups.append((("seg", int(f)), members[best:best + k]))
+        loose = np.flatnonzero((g.frame_of < 0) & ~self.abandoned)
+        for run in np.split(loose, np.flatnonzero(np.diff(loose) > 1) + 1):
+            for i in range(0, len(run), 2):
+                q = run[i:i + 2]
+                groups.append((("cam", int(q[0])), q))
+        return groups
+
+    def link_bev(self, eval_fn=None, on_round_end=None) -> list[dict]:
+        """Link everything outside the seed by position only: a group is tried against its K nearest
+        not-yet-tried seed cameras on the BEV (GPS east/north) map; on failure the next round tries
+        the next-nearest K (exhaustive search by BEV distance). No VGGT batches are spent on
+        densifying edges -- matching pairs come from predicted overlap later."""
+        g, cfg = self.graph, self.cfg
+        assert self.gps is not None, "BEV linking needs GPS"
+        self.relax = 1                    # merge: 2 overlapping cameras of the segment + GPS position check
+        bev = self.gps[:, :2]
+        history = self.history
+        for r in range(self.next_round, cfg.max_rounds):
+            gps_info = self._gps_update()
+            size0 = int((g.frame_of == g.seed_frame).sum())
+            seed_cams = g.cams_in(g.seed_frame)
+            plans = []
+            for key, q in self._bev_groups():
+                tried = self.bev_tried.setdefault(key, set())
+                d = np.linalg.norm(bev[seed_cams][:, None] - bev[q][None], axis=-1).min(1)
+                order = [int(c) for c in seed_cams[np.argsort(d)] if int(c) not in tried]
+                n_anchor = cfg.window - len(q)
+                if not order or len(tried) >= cfg.bev_max_rings * n_anchor:
+                    self.abandoned[q if key[0] == "cam" else g.cams_in(key[1])] = True
+                    self.log(stage="link_bev", event="abandon", group=list(map(int, q)), tried=len(tried))
+                    continue
+                anchors = order[:n_anchor]
+                tried.update(anchors)
+                plans.append((key, q, np.array(anchors)))
+            if not plans:
+                break
+            counts: dict[str, int] = {}
+            for key, q, anchors in plans:
+                b = self.run_batch(np.concatenate([q, anchors]).astype(int), "link")
+                bid = len(g.batches)
+                g.batches.append(dict(idx=b.idx.tolist(), kind="link_bev", health=b.health))
+                if not self.healthy(b):
+                    counts["unhealthy"] = counts.get("unhealthy", 0) + 1
+                    continue
+                g.add_measurement(b)
+                res = self._integrate(b, bid)
+                ok = bool((g.frame_of[q] == g.seed_frame).any())
+                counts[res if ok else f"{res}:not_linked"] = counts.get(res if ok else f"{res}:not_linked", 0) + 1
+            ba = self.bundle_adjust() if cfg.coarse_ba == "every_round" else {}
+            size1 = int((g.frame_of == g.seed_frame).sum())
+            rec = dict(round=r + 1, planned=len(plans), outcomes=counts, seed_size=size1,
+                       segments=len(g.frames()), unregistered=int((g.frame_of < 0).sum()),
+                       abandoned=int(self.abandoned.sum()), ba=ba, **gps_info)
+            if eval_fn is not None:
+                rec["eval"] = eval_fn(self, f"bev{r + 1}")
+            history.append(rec)
+            self.log(stage="link_bev", **{k: v for k, v in rec.items() if k != "eval"})
+            self.next_round = r + 1
+            if on_round_end is not None:
+                on_round_end(self, r + 1)
+        if cfg.coarse_ba == "final":
+            if self.gps is not None:
+                self._gps_update(detach=False)   # map GPS onto the final seed frame for the BA prior
+            self.history.append(dict(final_ba=self.bundle_adjust()))
+        self.finished = True
         return history
 
     # ------------------------------------------------------------ checkpoints
 
     _STATE = ("graph", "link_attempts", "relax", "abandoned", "pending_merges", "missing_pairs",
-              "inference_time", "rng", "history", "next_round", "finished", "stage", "eval_stages_saved")
+              "inference_time", "rng", "history", "next_round", "finished", "stage", "eval_stages_saved",
+              "bev_tried")
 
     def save_checkpoint(self, path: Path, stage: str) -> None:
         """Pickle the full builder state (everything except the model) + write node_status.json beside it."""

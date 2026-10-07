@@ -91,6 +91,8 @@ def main():
     ap.add_argument("--ckpt-dir", type=Path, default=None, help="default: <out>/ckpt")
     ap.add_argument("--resume", type=Path, default=None,
                     help="checkpoint .pkl to continue from (sweep/origin/round_XX/latest); CLI config applies")
+    ap.add_argument("--link-mode", choices=("grow", "bev"), default=None,
+                    help="bev (default with --use-gps): GPS-BEV kNN linking only; grow: densify/verify/link/span rounds")
     ap.add_argument("--use-gps", action="store_true", help="use EXIF GPS from AT-export.xml as a position prior")
     ap.add_argument("--gps-noise-m", type=float, default=0.0,
                     help="add N(0, sigma) noise per axis to GPS (simulate consumer GNSS; HAV GPS is RTK-grade)")
@@ -104,6 +106,8 @@ def main():
             ap.add_argument(f"--{f.name.replace('_', '-')}", type=type(f.default), default=f.default)
     args = ap.parse_args()
     cfg = BuilderConfig(**{f.name: getattr(args, f.name) for f in dataclasses.fields(BuilderConfig)})
+    if args.link_mode is None:
+        args.link_mode = "bev" if args.use_gps else "grow"
 
     scene = load_reference_scene(args.scene)
     names = [c.name for c in scene.graph.cameras]          # alphabetical = capture order
@@ -111,7 +115,14 @@ def main():
     image_dir = args.image_dir or Path("runs/cache") / f"{scene_name}_images_w518"
     paths = [image_dir / n for n in names]
     assert all(p.exists() for p in paths), f"missing cached images in {image_dir} (run scripts/cache_images.py)"
-    evaluate = make_eval(scene, reference_footprint(scene))
+    _evaluate = make_eval(scene, reference_footprint(scene))
+    eval_time = [0.0]
+
+    def evaluate(builder, tag):                      # evaluation vs COLMAP is diagnostics, not pipeline time
+        t = time.time()
+        out = _evaluate(builder, tag)
+        eval_time[0] += time.time() - t
+        return out
 
     gps = None
     if args.use_gps:
@@ -152,13 +163,20 @@ def main():
         def on_round_end(builder, r):
             builder.eval_stages.append(builder.history[-1]["eval"])
             checkpoint(f"round_{r:02d}" if args.keep_round_ckpts else "latest", "round")
-        b.grow(eval_fn=evaluate, on_round_end=on_round_end)
+        if args.link_mode == "bev":
+            b.link_bev(eval_fn=evaluate, on_round_end=on_round_end)
+        else:
+            b.grow(eval_fn=evaluate, on_round_end=on_round_end)
+        b.eval_stages.append(evaluate(b, "final"))
+        checkpoint("final", "round")
 
-    metrics = dict(config=dataclasses.asdict(cfg), use_gps=args.use_gps, gps_noise_m=args.gps_noise_m,
+    metrics = dict(config=dataclasses.asdict(cfg), link_mode=args.link_mode, use_gps=args.use_gps, gps_noise_m=args.gps_noise_m,
                    gps_detached=b.gps_detached, stages=b.eval_stages,
                    rounds=[{k: v for k, v in r.items() if k != "eval"} for r in b.history],
                    resumed_from=str(args.resume) if args.resume else None)
-    metrics["time"] = dict(this_session_s=time.time() - t0, inference_s=b.inference_time, batches=len(b.graph.batches))
+    total = time.time() - t0
+    metrics["time"] = dict(this_session_s=total, eval_s=eval_time[0], pipeline_s=total - eval_time[0],
+                           inference_s=b.inference_time, batches=len(b.graph.batches))
     print(json.dumps(metrics["time"]))
 
     args.out.mkdir(parents=True, exist_ok=True)

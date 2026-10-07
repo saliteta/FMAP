@@ -12,7 +12,8 @@ from PIL import Image
 def _extract(path: Path, max_width: int, max_features: int):
     im = Image.open(path)
     W, H = im.size
-    im.draft("L", (max_width, max_width))          # fast JPEG DCT downscale
+    # fast JPEG DCT downscale: the box must keep the aspect ratio, otherwise draft() keeps full resolution
+    im.draft("L", (max_width, max_width * H // W))
     im = im.convert("L")
     if im.width > max_width:
         im = im.resize((max_width, round(im.height * max_width / im.width)), Image.BICUBIC)

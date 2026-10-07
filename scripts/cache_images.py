@@ -15,7 +15,7 @@ def resize_one(src: Path, dst: Path, width: int) -> None:
     if dst.exists():
         return
     im = Image.open(src)
-    im.draft("RGB", (width, width))              # fast JPEG DCT downscale
+    im.draft("RGB", (width, width * im.height // im.width))   # JPEG DCT downscale (box keeps aspect ratio)
     im = im.convert("RGB")
     h = round(im.height * width / im.width)
     im.resize((width, h), Image.BICUBIC).save(dst, quality=95)

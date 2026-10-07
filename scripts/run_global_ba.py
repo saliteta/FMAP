@@ -44,12 +44,20 @@ def main():
     ap.add_argument("--max-features", type=int, default=8192)
     ap.add_argument("--pair-overlap", type=float, default=0.1, help="graph edges (measured or predicted) to match")
     ap.add_argument("--topk", type=int, default=20, help="match top-K neighbours per image (0 = threshold mode)")
-    ap.add_argument("--sift-cache", type=Path, default=Path("runs/cache/sift"))
+    ap.add_argument("--sift-cache", type=Path, default=Path("runs/cache/sift"), help="feature cache directory")
+    ap.add_argument("--features", choices=("sift", "superpoint", "aliked"), default="sift")
+    ap.add_argument("--ratio", type=float, default=0.85, help="Lowe ratio for mutual-NN matching")
+    ap.add_argument("--guided", action="store_true", help="depth-guided matching from VGGT depth + graph poses")
+    ap.add_argument("--guide-radius", type=float, default=150.0, help="search radius (full-res px) around the prediction")
     ap.add_argument("--topk-min-overlap", type=float, default=0.05)
     ap.add_argument("--init-reproj-px", type=float, default=64.0, help="triangulation filter with initial poses")
     ap.add_argument("--filter-px", type=str, default="16,8,4")
     ap.add_argument("--fix-intrinsics", action="store_true")
     ap.add_argument("--max-tracks", type=int, default=0, help="subsample tracks for BA (0 = all)")
+    ap.add_argument("--min-track-len", type=int, default=3,
+                    help="drop tracks seen in fewer images (default 3: no 2-view tracks; BA 5x faster, same accuracy)")
+    ap.add_argument("--ba-ftol", type=float, default=5e-4, help="LM relative-improvement stopping tolerance")
+    ap.add_argument("--tracks-cache", type=Path, default=None, help="reuse matches/tracks from another run's pickle")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     T = {}
@@ -68,12 +76,14 @@ def main():
 
     # ---- initial poses in meters (GPS) and full-resolution intrinsics (VGGT, shared camera)
     w2c0 = g.w2c[cams].copy()
+    depth_scale = 1.0
     if args.use_gps:
         scene_name = args.scene.parent.name if args.scene.name == "colmap_metrics" else args.scene.name
         gps, ok = gps_enu_for(names, args.scene / "AT-export.xml", cache=Path("runs/cache") / f"{scene_name}_gps.npz")
         m = ok[cams]
         S = robust_umeyama(centers(w2c0[m]), gps[cams][m])
         w2c0 = S.apply_w2c(w2c0)
+        depth_scale = S.s
         print(f"seed frame -> ENU meters: scale {S.s:.3f}", flush=True)
     W, H = ref[0].width, ref[0].height
     h_m, w_m = g.image_hw
@@ -87,7 +97,11 @@ def main():
     # ---- features on the original images
     t = time.time()
     paths = [args.scene / "images" / names[c] for c in cams]
-    feats = extract_features(paths, args.sift_cache, args.match_width, args.max_features)
+    if args.features == "sift":
+        feats = extract_features(paths, args.sift_cache, args.match_width, args.max_features)
+    else:
+        from fgsfm.match.learned import extract_features_learned
+        feats = extract_features_learned(paths, args.sift_cache, args.features, args.match_width, args.max_features)
     T["features_s"] = time.time() - t
     print(f"features: median {int(np.median([len(f['xy']) for f in feats]))} per image ({T['features_s']:.0f}s)", flush=True)
 
@@ -107,8 +121,10 @@ def main():
     else:
         E = Sc >= args.pair_overlap
     pairs = [(int(i), int(j)) for i, j in zip(*np.nonzero(np.triu(E)))]
-    pair_tag = f"k{args.topk}" if args.topk > 0 else f"o{args.pair_overlap}"
-    cache = args.out / f"tracks_w{args.match_width}_n{args.max_features}_{pair_tag}.pkl"
+    pair_tag = (f"k{args.topk}" if args.topk > 0 else f"o{args.pair_overlap}") + \
+        ("" if args.features == "sift" else f"_{args.features}_r{args.ratio}") + \
+        (f"_guided{args.guide_radius:.0f}" if args.guided else "")
+    cache = args.tracks_cache or args.out / f"tracks_w{args.match_width}_n{args.max_features}_{pair_tag}.pkl"
     if cache.exists():
         with open(cache, "rb") as f:
             c = pickle.load(f)
@@ -116,7 +132,28 @@ def main():
         print(f"loaded cached matches/tracks from {cache}", flush=True)
     else:
         t = time.time()
-        matches = match_pairs(feats, pairs)
+        if args.guided:
+            from fgsfm.match.guided import guided_match_pairs
+            hm, wm = g.image_hw
+            nx = (wm + 3) // 4
+
+            def depth_of(li, xy):
+                """VGGT depth (meters) at full-res keypoints of local camera li (stride-4 sample grid)."""
+                c = cams[li]
+                d, v = g.depth[c], g.depth_valid[c]
+                if d is None:
+                    return np.full(len(xy), np.nan)
+                gx = np.clip(np.round((xy[:, 0] * wm / W - 0.5) / 4).astype(int), 0, nx - 1)
+                gy = np.clip(np.round((xy[:, 1] * hm / H - 0.5) / 4).astype(int), 0, (hm + 3) // 4 - 1)
+                k = gy * nx + gx
+                return np.where(v[k], d[k] * depth_scale, np.nan)
+
+            matches, gstats = guided_match_pairs(feats, pairs, w2c0, K0, depth_of, radius=args.guide_radius,
+                                                 ratio=args.ratio)
+            print(f"guided matching: {gstats['guided']} pairs verified from guided matches, "
+                  f"{gstats['fallback']} more from fallback", flush=True)
+        else:
+            matches = match_pairs(feats, pairs, ratio=args.ratio)
         T["matching_s"] = time.time() - t
         print(f"pairs: {len(pairs)} graph edges -> {len(matches)} verified "
               f"(median {int(np.median([len(v) for v in matches.values()]))} inliers) ({T['matching_s']:.0f}s)", flush=True)
@@ -130,6 +167,9 @@ def main():
             pickle.dump(dict(matches=matches, tracks=tracks), f, protocol=pickle.HIGHEST_PROTOCOL)
     lens = np.array([len(o) for o in tracks.obs_img])
     print(f"tracks: {len(tracks)} triangulated, mean length {lens.mean():.2f}", flush=True)
+    if args.min_track_len > 2:
+        tracks = subset(tracks, np.array([len(o) >= args.min_track_len for o in tracks.obs_img]))
+        print(f"  kept {len(tracks)} tracks with >= {args.min_track_len} views", flush=True)
     if args.max_tracks and len(tracks) > args.max_tracks:
         sel = np.random.default_rng(0).choice(len(tracks), args.max_tracks, replace=False)
         m = np.zeros(len(tracks), bool)
@@ -143,7 +183,7 @@ def main():
     e0, _ = reprojection_errors(w2c0, K0, tracks, feats)
     t = time.time()
     out = run_global_ba(w2c0, K0, (W, H), tracks, feats, tuple(float(x) for x in args.filter_px.split(",")),
-                        options=dict(optimize_intrinsics=not args.fix_intrinsics))
+                        options=dict(optimize_intrinsics=not args.fix_intrinsics, function_tolerance=args.ba_ftol))
     T["ba_s"] = time.time() - t
     after = pose_metrics(out.w2c, w2c_ref)
     T["total_s"] = time.time() - t0
@@ -168,7 +208,7 @@ def main():
                         obs_image=obs_img.astype(np.int32), obs_xy=obs_xy.astype(np.float32),
                         obs_per_image=np.bincount(obs_img, minlength=len(cams)))
     (args.out / "metrics.json").write_text(json.dumps(dict(
-        ckpt=str(args.ckpt), use_gps=args.use_gps, match_width=args.match_width, pairs=len(pairs),
+        ckpt=str(args.ckpt), use_gps=args.use_gps, match_width=args.match_width, features=args.features, ratio=args.ratio, pairs=len(pairs),
         verified_pairs=len(matches), tracks_initial=len(tracks), ba_stages=dict(reproj=out.reproj_px, tracks=out.num_tracks),
         before=before, after=after, focal=dict(init=K0[0, 0], ba=out.K[0, 0], ref=ref[0].K[0, 0]), time=T),
         indent=1, default=float))

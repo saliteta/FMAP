@@ -32,7 +32,8 @@ def score_to_rgb(t: np.ndarray) -> np.ndarray:
 
 def load_thumbnail(path: Path, max_side: int) -> np.ndarray:
     im = Image.open(path)
-    im.draft("RGB", (max_side, max_side))       # fast JPEG DCT downscale
+    s = max_side / max(im.size)
+    im.draft("RGB", (round(im.width * s), round(im.height * s)))   # JPEG DCT downscale, aspect kept
     im = im.convert("RGB")
     im.thumbnail((max_side, max_side))
     return np.asarray(im)

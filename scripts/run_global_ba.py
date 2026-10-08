@@ -57,6 +57,10 @@ def main():
     ap.add_argument("--min-track-len", type=int, default=3,
                     help="drop tracks seen in fewer images (default 3: no 2-view tracks; BA 5x faster, same accuracy)")
     ap.add_argument("--ba-ftol", type=float, default=5e-4, help="LM relative-improvement stopping tolerance")
+    ap.add_argument("--ba-max-iters", type=int, default=100, help="LM iteration cap per BA stage")
+    ap.add_argument("--init-from-ref", choices=("none", "poses", "poses+K"), default="none",
+                    help="diagnostic: start BA from the reference (Bentley AT) poses [and intrinsics, principal point "
+                         "included]; tracks are re-triangulated from the cached matches")
     ap.add_argument("--tracks-cache", type=Path, default=None, help="reuse matches/tracks from another run's pickle")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -91,6 +95,12 @@ def main():
     Kf[:, 0] *= W / w_m
     Kf[:, 1] *= H / h_m
     K0 = np.array([[np.median(Kf[:, 0, 0]), 0, W / 2], [0, np.median(Kf[:, 1, 1]), H / 2], [0, 0, 1.0]])
+    if args.init_from_ref != "none":
+        w2c0 = np.stack([ref[c].pose_w2c for c in cams])           # reference frame (meters)
+        if args.init_from_ref == "poses+K":
+            K0 = ref[cams[0]].K.copy()
+        print(f"DIAGNOSTIC: BA initialized from the reference {args.init_from_ref} "
+              f"(fx={K0[0, 0]:.1f} cx={K0[0, 2]:.1f} cy={K0[1, 2]:.1f})", flush=True)
     print(f"initial intrinsics (VGGT, full res): fx={K0[0, 0]:.1f} fy={K0[1, 1]:.1f}  "
           f"[reference fx={ref[0].K[0, 0]:.1f}]", flush=True)
 
@@ -129,6 +139,9 @@ def main():
         with open(cache, "rb") as f:
             c = pickle.load(f)
         matches, tracks = c["matches"], c["tracks"]
+        if args.init_from_ref != "none":
+            tracks = build_tracks(matches, [len(f["xy"]) for f in feats])
+            tracks = subset(tracks, triangulate(tracks, feats, w2c0, K0, args.init_reproj_px))
         print(f"loaded cached matches/tracks from {cache}", flush=True)
     else:
         t = time.time()
@@ -183,7 +196,8 @@ def main():
     e0, _ = reprojection_errors(w2c0, K0, tracks, feats)
     t = time.time()
     out = run_global_ba(w2c0, K0, (W, H), tracks, feats, tuple(float(x) for x in args.filter_px.split(",")),
-                        options=dict(optimize_intrinsics=not args.fix_intrinsics, function_tolerance=args.ba_ftol))
+                        options=dict(optimize_intrinsics=not args.fix_intrinsics, function_tolerance=args.ba_ftol,
+                                     max_num_iterations=args.ba_max_iters))
     T["ba_s"] = time.time() - t
     after = pose_metrics(out.w2c, w2c_ref)
     T["total_s"] = time.time() - t0

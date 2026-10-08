@@ -84,6 +84,12 @@ def main():
     ap.add_argument("--restrict-to", type=Path, default=None,
                     help="split.json of an earlier export: use exactly its image list (fails if a name is missing)")
     ap.add_argument("--only", choices=("both", "colmap", "ours"), default="both")
+    ap.add_argument("--min-point-track-len", type=int, default=2,
+                    help="ours: initialize 3DGS only from BA tracks seen in >= this many images")
+    ap.add_argument("--max-point-reproj", type=float, default=float("inf"),
+                    help="ours: drop points whose mean reprojection error (full-res px, final BA poses) exceeds this")
+    ap.add_argument("--min-point-angle", type=float, default=0.0,
+                    help="ours: drop points whose max triangulation angle (deg) is below this")
     args = ap.parse_args()
 
     ref = ColmapModel.load(args.scene / "sparse" / "0")
@@ -139,6 +145,19 @@ def main():
     images = [(k + 1, d["w2c"][pos[n]], 1, n) for k, n in enumerate(names)]
     xyz = d["points"].astype(np.float64)
     rgb = np.zeros((len(xyz), 3), np.uint8)
+    track_len = np.bincount(d["obs_track"], minlength=len(xyz))
+    # per-point quality from the final BA: mean reprojection error and max triangulation angle
+    t_, im_, uv_ = d["obs_track"], d["obs_image"], d["obs_xy"].astype(np.float64)
+    Xc = np.einsum("nij,nj->ni", d["w2c"][im_, :3, :3], xyz[t_]) + d["w2c"][im_, :3, 3]
+    pr = Xc @ K.T
+    err = np.linalg.norm(pr[:, :2] / pr[:, 2:] - uv_, axis=1)
+    mean_reproj = np.bincount(t_, err, minlength=len(xyz)) / np.maximum(track_len, 1)
+    Cc = -np.einsum("nji,nj->ni", d["w2c"][:, :3, :3], d["w2c"][:, :3, 3])
+    ray = xyz[t_] - Cc[im_]
+    ray /= np.linalg.norm(ray, axis=1, keepdims=True)
+    r0 = ray[np.unique(t_, return_index=True)[1]][t_]
+    max_angle = np.zeros(len(xyz))
+    np.maximum.at(max_angle, t_, np.degrees(np.arccos(np.clip((ray * r0).sum(1), -1, 1))))
     first = np.unique(d["obs_track"], return_index=True)[1]          # one observation per track
     s = args.width / W
     first_img = d["obs_image"][first]
@@ -151,7 +170,11 @@ def main():
         xy = np.clip(np.round(d["obs_xy"][obs] * s).astype(int), 0, [arr.shape[1] - 1, arr.shape[0] - 1])
         rgb[d["obs_track"][obs]] = arr[xy[:, 1], xy[:, 0]]
     if args.only in ("both", "ours"):
-        make("ours", [(1, W, H, np.array([K[0, 0], K[1, 1], K[0, 2], K[1, 2]]))], images, xyz, rgb)
+        keep = (track_len >= args.min_point_track_len) & (mean_reproj <= args.max_point_reproj) & \
+            (max_angle >= args.min_point_angle)
+        print(f"ours: {keep.sum()} / {len(xyz)} points (track >= {args.min_point_track_len} views, "
+              f"mean reproj <= {args.max_point_reproj} px, tri angle >= {args.min_point_angle} deg)")
+        make("ours", [(1, W, H, np.array([K[0, 0], K[1, 1], K[0, 2], K[1, 2]]))], images, xyz[keep], rgb[keep])
 
     (args.out / "split.json").write_text(json.dumps(dict(
         names=names, test=[n for i, n in enumerate(names) if i % 8 == 0], dropped_ours=dropped,

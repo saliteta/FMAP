@@ -92,7 +92,10 @@ def _to_instantsfm(w2c, K, wh, tracks: TrackSet, feats):
 
 
 def run_global_ba(w2c0: np.ndarray, K0: np.ndarray, wh: tuple[int, int], tracks: TrackSet, feats: list[dict],
-                  filter_px=(16.0, 8.0, 4.0), options: dict | None = None, device: str = "cuda:0") -> BAOutput:
+                  filter_px=(16.0, 8.0, 4.0), options: dict | None = None, device: str = "cuda:0",
+                  intrinsics_mode: str = "shared_f+pp") -> BAOutput:
+    """intrinsics_mode: "shared_f+pp" (default; one focal + principal point, fgsfm/ba/full_intrinsics.py)
+    | "focal+pp" | "focal" (InstantSfM TorchBA: principal point fixed at the given value)."""
     opts = dict(DEFAULT_OPTIONS, **(options or {}))
     w2c, K = w2c0.copy(), K0.copy()
     reproj, ntracks = [], []
@@ -101,7 +104,11 @@ def run_global_ba(w2c0: np.ndarray, K0: np.ndarray, wh: tuple[int, int], tracks:
         tracks = filter_tracks(w2c, K, tracks, feats, 4 * px)              # loose pre-filter of gross outliers
         e0, _ = reprojection_errors(w2c, K, tracks, feats)
         cams, imgs, trk = _to_instantsfm(w2c, K, wh, tracks, feats)
-        ba.Solve(cams, imgs, trk, opts, use_depths=False, optimize_intrinsics=opts["optimize_intrinsics"])
+        if intrinsics_mode == "focal" or not opts["optimize_intrinsics"]:
+            ba.Solve(cams, imgs, trk, opts, use_depths=False, optimize_intrinsics=opts["optimize_intrinsics"])
+        else:
+            from fgsfm.ba.full_intrinsics import solve_full_intrinsics
+            solve_full_intrinsics(cams, imgs, trk, opts, mode=intrinsics_mode, device=device)
         # Solve filters tracks by min views and updates containers in place: read everything back
         w2c = imgs.world2cams.copy()
         fx, fy, cx, cy = cams.params[0, :4]
@@ -112,5 +119,5 @@ def run_global_ba(w2c0: np.ndarray, K0: np.ndarray, wh: tuple[int, int], tracks:
         reproj.append((float(np.median(e0)), float(np.median(e1))))
         ntracks.append(len(tracks))
         print(f"  BA stage (filter {px:.0f}px): reproj median {np.median(e0):.2f} -> {np.median(e1):.2f} px, "
-              f"tracks kept {len(tracks)}, f=({fx:.1f}, {fy:.1f})", flush=True)
+              f"tracks kept {len(tracks)}, f=({fx:.1f}, {fy:.1f}) pp=({cx:.1f}, {cy:.1f})", flush=True)
     return BAOutput(w2c, K, tracks, reproj, ntracks)

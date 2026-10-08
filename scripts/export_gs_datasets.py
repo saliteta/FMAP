@@ -80,7 +80,8 @@ def main():
     ap.add_argument("--ba", type=Path, required=True, help="ba_result.npz from run_global_ba.py")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--width", type=int, default=1600)
-    ap.add_argument("--min-obs", type=int, default=100)
+    ap.add_argument("--min-obs", type=int, default=20,
+                    help="ours: cameras need >= this many BA observations (BA keeps tracks with >= 3 views)")
     ap.add_argument("--restrict-to", type=Path, default=None,
                     help="split.json of an earlier export: use exactly its image list (fails if a name is missing)")
     ap.add_argument("--only", choices=("both", "colmap", "ours"), default="both")

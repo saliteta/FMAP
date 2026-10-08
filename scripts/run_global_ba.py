@@ -58,6 +58,9 @@ def main():
                     help="drop tracks seen in fewer images (default 3: no 2-view tracks; BA 5x faster, same accuracy)")
     ap.add_argument("--ba-ftol", type=float, default=5e-4, help="LM relative-improvement stopping tolerance")
     ap.add_argument("--ba-max-iters", type=int, default=100, help="LM iteration cap per BA stage")
+    ap.add_argument("--intrinsics", choices=("focal", "focal+pp", "shared_f+pp"), default="shared_f+pp",
+                    help="intrinsics BA optimizes: shared_f+pp (default: one focal + principal point); "
+                         "focal = InstantSfM behaviour (principal point fixed at the image center)")
     ap.add_argument("--init-from-ref", choices=("none", "poses", "poses+K"), default="none",
                     help="diagnostic: start BA from the reference (Bentley AT) poses [and intrinsics, principal point "
                          "included]; tracks are re-triangulated from the cached matches")
@@ -197,7 +200,7 @@ def main():
     t = time.time()
     out = run_global_ba(w2c0, K0, (W, H), tracks, feats, tuple(float(x) for x in args.filter_px.split(",")),
                         options=dict(optimize_intrinsics=not args.fix_intrinsics, function_tolerance=args.ba_ftol,
-                                     max_num_iterations=args.ba_max_iters))
+                                     max_num_iterations=args.ba_max_iters), intrinsics_mode=args.intrinsics)
     T["ba_s"] = time.time() - t
     after = pose_metrics(out.w2c, w2c_ref)
     T["total_s"] = time.time() - t0
@@ -221,7 +224,8 @@ def main():
                         points=out.tracks.xyz.astype(np.float32), obs_track=obs_trk.astype(np.int32),
                         obs_image=obs_img.astype(np.int32), obs_xy=obs_xy.astype(np.float32),
                         obs_per_image=np.bincount(obs_img, minlength=len(cams)))
-    (args.out / "metrics.json").write_text(json.dumps(dict(
+    (args.out / "metrics.json").write_text(json.dumps(dict(intrinsics_mode=args.intrinsics,
+        K_final=out.K.tolist(), K_ref=ref[cams[0]].K.tolist(),
         ckpt=str(args.ckpt), use_gps=args.use_gps, match_width=args.match_width, features=args.features, ratio=args.ratio, pairs=len(pairs),
         verified_pairs=len(matches), tracks_initial=len(tracks), ba_stages=dict(reproj=out.reproj_px, tracks=out.num_tracks),
         before=before, after=after, focal=dict(init=K0[0, 0], ba=out.K[0, 0], ref=ref[0].K[0, 0]), time=T),

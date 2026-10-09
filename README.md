@@ -166,7 +166,7 @@ python scripts/export_gs_datasets.py --scene $SCENE --ba runs/ab5_gps_prior/ba_r
 
 - Make VGGT densification part of the 3DGS export. Try denser lifting (stride 1–2), a cross-view consistency filter and other point budgets.
 - Harder benchmark: SZTU (1500 images) with RTK GPS, then consumer-grade GPS, then no GPS (time sequence only).
-- [Explicit geometry register](docs/explicit_geometry_register.md): link islands through a register of distinctive 3D landmarks described by VGGT(-Ω) tokens, so the no-GPS regime needs no image-level search. First step: a token-consistency study with VGGT-1B and VGGT-Ω.
+- [Explicit geometry register](docs/explicit_geometry_register.md): store VGGT-Ω's camera and register tokens of each small batch in its scene-graph node, and merge nodes by running VGGT-Ω's camera head on the stored tokens of several nodes, instead of larger batches or GPS-guided linking. First step: a zero-shot merge test on HAV.
 - Run on the other GauUscene scenes to check that the findings hold.
 
 ---

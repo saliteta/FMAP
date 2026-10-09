@@ -80,6 +80,72 @@ Findings:
 
 Figures in `runs/<run>/figures/`: VGGT vs reference scatter plots, PR curves, overlap matrices in flight order, rotation error vs covisibility, disagreement gallery.
 
+### HAV end-to-end: pose accuracy, A/B tests, 3DGS
+
+Setup:
+- **Pose reference:** the Bentley ContextCapture AT, constrained by RTK GPS.
+- **3DGS:** gsplat 1.5.1, 30k steps, images at 1600 px.
+- **Test split:** every 8th image is held out (52 test views), on the 411 images that every method registered.
+- **Statistics:** per-view comparisons use a paired Wilcoxon test.
+- **Caveat:** every 3DGS number comes from a single training run (no seed repeats).
+
+**Pose agreement with Bentley** (median relative rotation error; AUC@5° on relative poses):
+
+| Method | Rel. rot. | AUC@5 | Time |
+|---|---|---|---|
+| Ours: VGGT graph + global BA, `shared_f+pp` (default) | 0.026° | 0.985 | 554 s |
+| Ours + RTK camera-center prior in BA (`--gps-prior-sigma 0.05`) | **0.017°** | 0.988 | — |
+| COLMAP 4.2.1 `pose_prior_mapper` + GPS + principal point | 0.020° | 0.992 | 946 s |
+| GLOMAP (COLMAP 4.2.1 `global_mapper`) + principal point + EXIF focal | 0.024° | 0.991 | 903 s |
+| COLMAP incremental, default (principal point fixed) | 0.499° | — | 1202 s |
+| GLOMAP, default (principal point fixed) | 0.505° | — | 975 s |
+
+- With the RTK prior, our camera centers are within 3.1 cm (median) of Bentley's.
+- **The principal point is the main factor.** The true principal point is (2756, 1797), 33.6 px from the image center. Fixing it at the center acts like a ~0.5° systematic tilt. That alone explains every 0.45–0.5° result, ours included before we refined it. Initialised from Bentley's own poses with a centered principal point, our BA drifts back to 0.455°; with Bentley's principal point it stays at 0.022°.
+
+**3DGS on the poses' own sparse points:**
+
+| Poses (+ their own triangulated points) | PSNR | SSIM | LPIPS |
+|---|---|---|---|
+| COLMAP + GPS + pp | 24.25 | 0.794 | 0.204 |
+| Ours `shared_f+pp` | 24.06 | — | — |
+| Bentley AT (its tie points) | 24.04 | — | — |
+| Ours + RTK prior (best poses) | 23.93 | 0.782 | 0.220 |
+| GLOMAP default | 23.42 | — | — |
+| Ours, principal point fixed | 23.23 | — | — |
+
+**A/B tests.** Each test swaps one COLMAP component into our pipeline, and each was followed by its own 3DGS run. The A/B code is not kept in the repo; only the results are recorded here.
+
+| Test | Rel. rot. | PSNR |
+|---|---|---|
+| A/B1: COLMAP keypoints + verified matches → our tracks + our BA | 0.034° | 23.90 |
+| A/B2: COLMAP final tracks (re-triangulated from our poses) → our BA | 0.028° | 24.16 |
+| A/B3: our tracks → COLMAP Ceres BA (f, pp, k1 refined) | 0.027° | 24.12 |
+| A/B5: our pipeline + RTK camera-center prior in BA | 0.017° | 23.93 |
+
+Swapping in COLMAP's graph, tracks or optimizer moves rotation agreement only within 0.017–0.034°. None of them reproduces a consistent PSNR advantage. A/B5 has the most accurate poses of every run but one of the lowest PSNRs, so pose accuracy is not what drives PSNR here.
+
+**Why our poses are at least as accurate as COLMAP's:**
+1. **Independent reference.** Against the RTK-constrained Bentley AT, our rotation agreement is 0.026° by default and 0.017° with the RTK prior. COLMAP + GPS reaches 0.020°.
+2. **Direct comparison.** The Sim(3) from our poses to COLMAP's is essentially the identity: scale 0.999999, 0.0012°, 4 mm. Camera centers differ by 3.4 cm median and 15.8 cm at most.
+3. **Same points, same PSNR.** Both pose sets were trained from one blended starting cloud: COLMAP's 299k points plus our 189k, expressed in the same frame. The result is 24.30 with COLMAP's poses and 24.30 with ours, a mean per-view difference of −0.008 dB.
+
+**Why the initial point cloud is the main cause of the PSNR gap:**
+1. **The gap is concentrated.** With each method's own points, ours trails COLMAP by 0.195 dB (better on only 14/52 views, p = 2e-4). Three outlier views (41, 02, 48) account for much of it, at −2.2, −1.2 and −1.1 dB. They are oblique views with a close foreground. Their error maps show floaters, smearing and missing geometry in regions the sparse points don't cover, not the image-wide edge misalignment a wrong pose would cause.
+2. **Fixing the points closes the gap.** With the blended starting points, our poses gain +0.37 dB (better on 43/52 views, p = 2e-6), while COLMAP's gain only +0.06 dB (not significant). The outlier views recover: view 02 goes from 20.1 to 23.6. The COLMAP-vs-ours gap falls from 0.195 dB to 0.008 dB.
+3. **Densifying our own points overtakes COLMAP.** VGGT depth corrected per image by the BA tracks (below) reaches **24.37 / 0.798 / 0.189**, PSNR / SSIM / LPIPS. That beats COLMAP's 24.25 / 0.794 / 0.204 on all three metrics. The PSNR gain per view is +0.11 dB mean (29/52 views, p = 0.044); against blended points it is +0.07 dB (p = 0.10).
+
+**VGGT densification of the 3DGS init** (`scripts/densify_vggt_points.py`, 92 s on CPU, needs no extra VGGT pass):
+- **Per-image correction:** for each training image, the stored VGGT depth samples (stride 4 on the 518×350 model image, confident pixels only) are fit to the BA track depths with a robust model, `log z_BA = a·log z_VGGT + poly2(u, v)`.
+- **Accuracy:** on held-out track observations, the corrected depth has a median relative error of 0.50%; scale-only correction gives 0.67%.
+- **Lifting:** samples are lifted with the BA pose, then thinned to one point per voxel, so that VGGT points plus track points total 2M.
+- **No test leakage:** test images are never lifted.
+
+```bash
+python scripts/densify_vggt_points.py --ba runs/ab5_gps_prior/ba_result.npz \
+    --ckpt runs/e2e_HAV/graph/ckpt/latest.pkl --base runs/gs_ab5/ours --out runs/gs_dense/ours --target 2000000
+```
+
 ### Code map (implemented)
 
 | Module | Content |
@@ -97,9 +163,9 @@ Figures in `runs/<run>/figures/`: VGGT vs reference scatter plots, PR curves, ov
 
 ### Next
 
-- Run on the other GauUscene scenes (CUHK_LOWER/UPPER, LFLS, SMBU, SZIIT, SZTU) to check that the findings hold.
-- Use the VGGT track head as *independent* evidence for edge verification.
-- Grow the graph from VGGT-predicted overlap instead of reference-pose batching (Stage 3), and gate batches by confidence.
+- Make VGGT densification part of the 3DGS export. Try denser lifting (stride 1–2), a cross-view consistency filter and other point budgets.
+- Harder benchmark: SZTU (1500 images) with RTK GPS, then consumer-grade GPS, then no GPS (time sequence only).
+- Run on the other GauUscene scenes to check that the findings hold.
 
 ---
 

@@ -135,15 +135,16 @@ Swapping in COLMAP's graph, tracks or optimizer moves rotation agreement only wi
 2. **Fixing the points closes the gap.** With the blended starting points, our poses gain +0.37 dB (better on 43/52 views, p = 2e-6), while COLMAP's gain only +0.06 dB (not significant). The outlier views recover: view 02 goes from 20.1 to 23.6. The COLMAP-vs-ours gap falls from 0.195 dB to 0.008 dB.
 3. **Densifying our own points overtakes COLMAP.** VGGT depth corrected per image by the BA tracks (below) reaches **24.37 / 0.798 / 0.189**, PSNR / SSIM / LPIPS. That beats COLMAP's 24.25 / 0.794 / 0.204 on all three metrics. The PSNR gain per view is +0.11 dB mean (29/52 views, p = 0.044); against blended points it is +0.07 dB (p = 0.10).
 
-**VGGT densification of the 3DGS init** (`scripts/densify_vggt_points.py`, 92 s on CPU, needs no extra VGGT pass):
+**VGGT densification of the 3DGS init** (`fgsfm/geometry/densify.py`, the default in `scripts/export_gs_datasets.py`; about 90 s on CPU, needs no extra VGGT pass):
 - **Per-image correction:** for each training image, the stored VGGT depth samples (stride 4 on the 518×350 model image, confident pixels only) are fit to the BA track depths with a robust model, `log z_BA = a·log z_VGGT + poly2(u, v)`.
 - **Accuracy:** on held-out track observations, the corrected depth has a median relative error of 0.50%; scale-only correction gives 0.67%.
 - **Lifting:** samples are lifted with the BA pose, then thinned to one point per voxel, so that VGGT points plus track points total 2M.
 - **No test leakage:** test images are never lifted.
 
 ```bash
-python scripts/densify_vggt_points.py --ba runs/ab5_gps_prior/ba_result.npz \
-    --ckpt runs/e2e_HAV/graph/ckpt/latest.pkl --base runs/gs_ab5/ours --out runs/gs_dense/ours --target 2000000
+# --dense-points 2000000 is the default (0 = BA track points only); the graph checkpoint is read from the BA's metrics.json
+python scripts/export_gs_datasets.py --scene $SCENE --ba runs/ab5_gps_prior/ba_result.npz --out runs/gs_dense \
+    --only ours --restrict-to runs/gs_HAV_fast/split.json
 ```
 
 ### Code map (implemented)

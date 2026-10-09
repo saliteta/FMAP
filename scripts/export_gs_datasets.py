@@ -12,11 +12,16 @@ index % 8 == 0.
     <out>/images/                      shared 1600 px images (JPEG q98, 4:4:4)
     <out>/colmap/{images -> ../images, sparse/0/{cameras.bin, images.bin, points3D.ply}}
     <out>/ours/  {images -> ../images, sparse/0/{...}}
+
+Ours is initialized with BA track points plus VGGT depth corrected per image by the tracks
+(fgsfm/geometry/densify.py), --dense-points in total (0 = track points only). Only training
+images are lifted.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import pickle
 import struct
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -28,6 +33,7 @@ from scipy.spatial.transform import Rotation
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from fgsfm.geometry.densify import lift_vggt_points, voxel_subsample
 from fgsfm.io.colmap_text import ColmapModel
 
 
@@ -91,6 +97,10 @@ def main():
                     help="ours: drop points whose mean reprojection error (full-res px, final BA poses) exceeds this")
     ap.add_argument("--min-point-angle", type=float, default=0.0,
                     help="ours: drop points whose max triangulation angle (deg) is below this")
+    ap.add_argument("--dense-points", type=int, default=2_000_000,
+                    help="ours: total initial points, BA tracks + VGGT depth corrected by the tracks (0 = tracks only)")
+    ap.add_argument("--ckpt", type=Path, default=None,
+                    help="graph checkpoint holding the VGGT depths (default: the 'ckpt' in the BA's metrics.json)")
     args = ap.parse_args()
 
     ref = ColmapModel.load(args.scene / "sparse" / "0")
@@ -175,7 +185,20 @@ def main():
             (max_angle >= args.min_point_angle)
         print(f"ours: {keep.sum()} / {len(xyz)} points (track >= {args.min_point_track_len} views, "
               f"mean reproj <= {args.max_point_reproj} px, tri angle >= {args.min_point_angle} deg)")
-        make("ours", [(1, W, H, np.array([K[0, 0], K[1, 1], K[0, 2], K[1, 2]]))], images, xyz[keep], rgb[keep])
+        xyz, rgb = xyz[keep], rgb[keep]
+        if args.dense_points > len(xyz):
+            ckpt = args.ckpt or Path(json.loads((args.ba.parent / "metrics.json").read_text())["ckpt"])
+            with open(ckpt, "rb") as f:
+                graph = pickle.load(f)["graph"]
+            train = {n for i, n in enumerate(names) if i % 8 != 0}
+            dx, dc, rep = lift_vggt_points(d, graph, train, img_dir)
+            errs = [r["held_out_rel_depth_err"] for r in rep.values()]
+            sel = voxel_subsample(dx, args.dense_points - len(xyz))
+            print(f"ours: VGGT densification from {ckpt}: {len(rep)} train images fitted "
+                  f"({sum('rejected' in r for r in rep.values())} rejected, held-out median rel depth err "
+                  f"{np.median(errs):.4f}), {len(dx)} lifted -> {len(sel)} kept")
+            xyz, rgb = np.concatenate([xyz, dx[sel]]), np.concatenate([rgb, dc[sel]])
+        make("ours", [(1, W, H, np.array([K[0, 0], K[1, 1], K[0, 2], K[1, 2]]))], images, xyz, rgb)
 
     (args.out / "split.json").write_text(json.dumps(dict(
         names=names, test=[n for i, n in enumerate(names) if i % 8 == 0], dropped_ours=dropped,

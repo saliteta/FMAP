@@ -93,7 +93,8 @@ def _to_instantsfm(w2c, K, wh, tracks: TrackSet, feats):
 
 def run_global_ba(w2c0: np.ndarray, K0: np.ndarray, wh: tuple[int, int], tracks: TrackSet, feats: list[dict],
                   filter_px=(16.0, 8.0, 4.0), options: dict | None = None, device: str = "cuda:0",
-                  intrinsics_mode: str = "shared_f+pp") -> BAOutput:
+                  intrinsics_mode: str = "shared_f+pp", center_prior: np.ndarray | None = None,
+                  prior_sigma: float = 0.05) -> BAOutput:
     """intrinsics_mode: "shared_f+pp" (default; one focal + principal point, fgsfm/ba/full_intrinsics.py)
     | "focal+pp" | "focal" (InstantSfM TorchBA: principal point fixed at the given value)."""
     opts = dict(DEFAULT_OPTIONS, **(options or {}))
@@ -108,7 +109,8 @@ def run_global_ba(w2c0: np.ndarray, K0: np.ndarray, wh: tuple[int, int], tracks:
             ba.Solve(cams, imgs, trk, opts, use_depths=False, optimize_intrinsics=opts["optimize_intrinsics"])
         else:
             from fgsfm.ba.full_intrinsics import solve_full_intrinsics
-            solve_full_intrinsics(cams, imgs, trk, opts, mode=intrinsics_mode, device=device)
+            solve_full_intrinsics(cams, imgs, trk, opts, mode=intrinsics_mode, device=device,
+                                  center_prior=center_prior, prior_sigma=prior_sigma)
         # Solve filters tracks by min views and updates containers in place: read everything back
         w2c = imgs.world2cams.copy()
         fx, fy, cx, cy = cams.params[0, :4]

@@ -35,6 +35,20 @@ def _project_fcxcy(points, extrinsics, intrinsics):
     return pc[..., :2] / pc[..., 2:3] * intrinsics[..., 0:1] + intrinsics[..., 1:3]
 
 
+# Camera-center prior written as the GPS point seen from the camera: T_w2c * g = R (g - C), so
+# ||T * g|| = ||g - C||. bae differentiates point transforms (Act) correctly; a direct C = T^-1 translation
+# residual gets wrong rotation columns under bae's left-perturbation convention (verified numerically).
+@map_transform
+def _prior_xy(extrinsics, target):
+    return pp.SE3(extrinsics).Act(target)[..., 0:2]
+
+
+@map_transform
+def _prior_z0(extrinsics, target):
+    z = pp.SE3(extrinsics).Act(target)[..., 2:3]
+    return torch.cat([z, torch.zeros_like(z)], dim=-1)
+
+
 class FullIntrinsicsReprojection(nn.Module):
     def __init__(self, image_extrs, intrinsics, points_3d, project):
         super().__init__()
@@ -44,13 +58,23 @@ class FullIntrinsicsReprojection(nn.Module):
         self.extrinsics.trim_SE3_grad = True
         self.project = project
 
-    def forward(self, points_2d, image_indices, camera_indices, point_indices):
-        return self.project(self.points_3d[point_indices], self.extrinsics[image_indices],
-                            self.intrinsics[camera_indices]) - points_2d
+    def forward(self, points_2d, image_indices, camera_indices, point_indices,
+                prior_images=None, prior_xy=None, prior_scale=None):
+        r = self.project(self.points_3d[point_indices], self.extrinsics[image_indices],
+                         self.intrinsics[camera_indices]) - points_2d
+        if prior_images is None:
+            return r
+        # camera-center prior (e.g. RTK GPS), as two 2-wide rows per camera so it concatenates with the
+        # reprojection rows: (dx, dy)/sigma and (dz, 0)/sigma
+        rx = _prior_xy(self.extrinsics[prior_images], prior_xy) * prior_scale
+        rz = _prior_z0(self.extrinsics[prior_images], prior_xy) * prior_scale
+        return torch.cat([r, rx, rz], dim=0)
 
 
-def solve_full_intrinsics(cameras, images, tracks, options: dict, mode: str = "focal+pp", device: str = "cuda:0"):
-    """Same contract as InstantSfM TorchBA.Solve (PINHOLE cameras): updates containers in place."""
+def solve_full_intrinsics(cameras, images, tracks, options: dict, mode: str = "focal+pp", device: str = "cuda:0",
+                          center_prior: np.ndarray | None = None, prior_sigma: float = 0.05):
+    """Same contract as InstantSfM TorchBA.Solve (PINHOLE cameras): updates containers in place.
+    center_prior: optional (num_images, 3) camera-center targets in the BA frame (NaN = none), weight 1/prior_sigma."""
     (image_extrs, camera_intrs, points_3d, camera_pps, remaining_indices, pp_indices, points_2d,
      image_indices, camera_indices, point_indices, _, image_idx2id, camera_idx2id) = _prepare_single_camera_data(
         cameras, images, tracks, _PINHOLE_INFO, device, options["min_num_view_per_track"], False)
@@ -66,6 +90,15 @@ def solve_full_intrinsics(cameras, images, tracks, options: dict, mode: str = "f
                    reject=30)
     inputs = dict(points_2d=points_2d, image_indices=image_indices, camera_indices=camera_indices,
                   point_indices=point_indices)
+    if center_prior is not None:
+        ids = np.array([image_idx2id[k] for k in range(len(image_idx2id))])
+        tgt = center_prior[ids]
+        ok = np.isfinite(tgt).all(1)
+        k_idx = np.flatnonzero(ok)
+        tt = torch.as_tensor(tgt[ok], dtype=torch.float64, device=device)
+        inputs.update(prior_images=torch.as_tensor(k_idx, dtype=torch.int32, device=device),
+                      prior_xy=tt.contiguous(),            # 3D GPS targets (name kept for the forward signature)
+                      prior_scale=1.0 / prior_sigma)
     hist = []
     for _ in range(options["max_num_iterations"]):
         hist.append(float(optimizer.step(inputs)))

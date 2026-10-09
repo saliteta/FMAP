@@ -47,6 +47,8 @@ def main():
     ap.add_argument("--sift-cache", type=Path, default=Path("runs/cache/sift"), help="feature cache directory")
     ap.add_argument("--features", choices=("sift", "superpoint", "aliked"), default="sift")
     ap.add_argument("--ratio", type=float, default=0.85, help="Lowe ratio for mutual-NN matching")
+    ap.add_argument("--gps-prior-sigma", type=float, default=0.0,
+                    help="> 0: RTK/GPS camera-center prior inside global BA with this std (m); needs --use-gps")
     ap.add_argument("--guided", action="store_true", help="depth-guided matching from VGGT depth + graph poses")
     ap.add_argument("--guide-radius", type=float, default=150.0, help="search radius (full-res px) around the prediction")
     ap.add_argument("--topk-min-overlap", type=float, default=0.05)
@@ -193,6 +195,12 @@ def main():
         tracks = subset(tracks, m)
         print(f"  subsampled to {len(tracks)} tracks", flush=True)
 
+    gps_ba = None
+    if args.gps_prior_sigma > 0:
+        assert args.use_gps, "--gps-prior-sigma needs --use-gps (BA frame = ENU meters)"
+        gps_ba = np.where(ok[cams][:, None], gps[cams], np.nan)
+        print(f"GPS prior in global BA: {int(np.isfinite(gps_ba).all(1).sum())} cameras, sigma {args.gps_prior_sigma} m", flush=True)
+
     # ---- global BA
     w2c_ref = np.stack([c.pose_w2c for c in ref])[cams]
     before = pose_metrics(w2c0, w2c_ref)
@@ -200,7 +208,8 @@ def main():
     t = time.time()
     out = run_global_ba(w2c0, K0, (W, H), tracks, feats, tuple(float(x) for x in args.filter_px.split(",")),
                         options=dict(optimize_intrinsics=not args.fix_intrinsics, function_tolerance=args.ba_ftol,
-                                     max_num_iterations=args.ba_max_iters), intrinsics_mode=args.intrinsics)
+                                     max_num_iterations=args.ba_max_iters), intrinsics_mode=args.intrinsics,
+                        center_prior=gps_ba, prior_sigma=args.gps_prior_sigma if args.gps_prior_sigma > 0 else 0.05)
     T["ba_s"] = time.time() - t
     after = pose_metrics(out.w2c, w2c_ref)
     T["total_s"] = time.time() - t0

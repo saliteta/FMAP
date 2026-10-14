@@ -4,3 +4,6 @@
 [submodule "third_party/InstantSfM"]
 	path = third_party/InstantSfM
 	url = https://github.com/cre185/InstantSfM.git
+[submodule "third_party/vggt_omega"]
+	path = third_party/vggt_omega
+	url = https://github.com/facebookresearch/vggt-omega.git

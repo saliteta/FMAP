@@ -45,6 +45,7 @@ from vggt_omega.utils.pose_enc import encoding_to_camera  # noqa: E402
 PRE = 17                                   # camera token + 16 registers per frame
 N_PATCH_Q = 64                             # patch queries per frame in global blocks
 CHUNK = 2048
+POOLS = ("mean", "qmax", "max")     # pooling of the token-to-token weights of a frame pair
 
 
 class MassProbe:
@@ -67,25 +68,68 @@ class MassProbe:
 
 
 def frame_mass(q, k, T):
-    """q, k (H, L, d), frames laid out contiguously with T tokens each -> {query set: (H, n, n) numpy}."""
-    H, L, d = q.shape
+    """Frame-to-frame attention mass of one inter-frame block, per head.
+
+    q, k: (H, L, d) queries / keys of EVERY token this block attends over, for ALL n frames of the batch (after
+    QK-norm, exactly what the block's softmax sees). Frames are laid out contiguously, T tokens each:
+        register block: T = 17   (camera + 16 registers per frame; patches are not in the sequence), L = 17 n
+        global block  : T = 1031 (camera + 16 registers + 1014 patches),                             L = 1031 n
+    Query sets per frame: "cam" (camera token), "reg" (16 registers), "patch" (64 evenly spaced patches, global
+    blocks only). Returns pooled_mass(...) of those sets; in global blocks also split by the key token type.
+    """
+    n = q.shape[1] // T
+    # token positions of frame f start at f * T: offset 0 = camera, 1..16 = registers, 17.. = patches
+    base = torch.arange(n, device=q.device)[:, None] * T                          # (n, 1) first token of each frame
+    sets = {"cam": base + 0,                                                      # (n, 1)  camera token
+            "reg": base + torch.arange(1, PRE, device=q.device)}                  # (n, 16) registers
+    key_groups = {"cam": slice(0, 1), "reg": slice(1, PRE)}                       # mass split by key token type
+    if T > PRE:                                                                   # global block: also some patches
+        sets["patch"] = base + PRE + torch.linspace(0, T - PRE - 1, N_PATCH_Q, device=q.device).long()  # (n, 64)
+        key_groups["patch"] = slice(PRE, T)
+    return pooled_mass(q, k, T, sets, q.shape[-1] ** -0.5, key_groups)
+
+
+def pooled_mass(q, k, T, sets, scale, key_groups=None):
+    """Pooled frame-to-frame attention weights, per head.
+
+    q, k: (H, L, d) with n frames laid out contiguously, T tokens each; sets: {name: (n, m) query token positions};
+    the softmax of each query runs over ALL L keys (every token of every frame, own frame included), with logits
+    scale * q.k. For head h and frame pair (i, j), the weights from the m query tokens of frame i to the T key
+    tokens of frame j (e.g. 16 x 17 in a register block) are pooled into:
+      "<set>"        sum over j's key tokens, mean over i's query tokens: the share of i's attention on frame j
+                     (each row sums to 1 over j, frame i itself included)
+      "<set>_qmax"   sum over j's key tokens, max over i's query tokens: the query token that leans most on j
+      "<set>_max"    max over all (query token, key token) weights: the single strongest token-to-token link
+      "<set>><grp>"  as "<set>", but only over j's key tokens of one type (key_groups: {grp: slice of offsets})
+    Returns {name: (H, n, n) numpy}.
+    """
+    H, L, _ = q.shape
     n = L // T
-    base = torch.arange(n, device=q.device)[:, None] * T
-    sets = {"cam": base + 0, "reg": base + torch.arange(1, PRE, device=q.device)}
-    if T > PRE:
-        sets["patch"] = base + PRE + torch.linspace(0, T - PRE - 1, N_PATCH_Q, device=q.device).long()
+    key_groups = key_groups or {}
     out = {}
     for name, idx in sets.items():
-        m = idx.shape[1]
-        flat = idx.reshape(-1)
-        res = torch.empty(H, n, n, device=q.device)
-        for h in range(H):
-            acc = []
-            for s in range(0, len(flat), CHUNK):
-                a = torch.softmax(q[h, flat[s:s + CHUNK]] @ k[h].T / d ** 0.5, dim=-1)   # (c, L)
-                acc.append(a.view(-1, n, T).sum(-1))                                     # (c, n) mass per frame
-            res[h] = torch.cat(acc).view(n, m, n).mean(1)
-        out[name] = res.cpu().numpy()
+        m = idx.shape[1]                                  # query tokens per frame in this set
+        flat = idx.reshape(-1)                            # (n*m,) frame 0's queries, then frame 1's, ...
+        res = {key: torch.empty(H, n, n, device=q.device)
+               for key in [name, f"{name}_qmax", f"{name}_max"] + [f"{name}>{g}" for g in key_groups]}
+        for h in range(H):                                # every head has its own softmax, kept separate
+            acc = {"sum": [], "max": [], **{g: [] for g in key_groups}}
+            for s in range(0, len(flat), CHUNK):          # chunk the queries to bound memory (c x L at a time)
+                # the block's real attention rows for these queries: softmax over ALL L keys of the batch,
+                # i.e. every token of every frame (own frame included), as in scaled_dot_product_attention
+                a = torch.softmax(q[h, flat[s:s + CHUNK]] @ k[h].T * scale, dim=-1)       # (c, L), rows sum to 1
+                a = a.view(-1, n, T)                      # keys grouped by frame: (c, key frame, key token)
+                acc["sum"].append(a.sum(-1))              # (c, n) mass per key frame (sum over its T tokens)
+                acc["max"].append(a.amax(-1))             # (c, n) strongest single key token of each key frame
+                for g, sl in key_groups.items():
+                    acc[g].append(a[..., sl].sum(-1))     # (c, n) mass on key frame's tokens of type g
+            per_q = {key: torch.cat(v).view(n, m, n) for key, v in acc.items()}   # (query frame, query token, key frame)
+            res[name][h] = per_q["sum"].mean(1)           # sum over key tokens, mean over query tokens (default)
+            res[f"{name}_qmax"][h] = per_q["sum"].amax(1)  # sum over key tokens, max over query tokens
+            res[f"{name}_max"][h] = per_q["max"].amax(1)   # max over all (query token x key token) weights
+            for g in key_groups:
+                res[f"{name}>{g}"][h] = per_q[g].mean(1)
+        out.update({key: r.cpu().numpy() for key, r in res.items()})
     return out
 
 
@@ -128,6 +172,26 @@ def score_all(M, G, O):
 
 def mean_dict(ds):
     return {k: float(np.mean([d[k] for d in ds])) for k in ds[0]}
+
+
+def evaluate_scores(data, get, keys):
+    """{key: metrics} for per-head scores get(d, key) -> (H, n, n): heads summed, and the best single head chosen
+    leave-one-batch-out by row AP (the choice never sees the batch it is scored on)."""
+    nb, res = len(data), {}
+    for key in keys:
+        head_row = np.array([[row_metrics(row_norm(get(d, key)[h]), d["G"])[0]
+                              for h in range(get(d, key).shape[0])] for d in data])   # (nb, H)
+        summed = [score_all(row_norm(get(d, key).sum(0)), d["G"], d["O"]) for d in data]
+        lobo = []
+        for t in range(nb):
+            h = int(np.argmax(np.delete(head_row, t, 0).mean(0)))
+            lobo.append(dict(head=h, **score_all(row_norm(get(data[t], key)[h]), data[t]["G"], data[t]["O"])))
+        res[key] = dict(sum_heads=mean_dict(summed),
+                        lobo_head=mean_dict([{k: v for k, v in r.items() if k != "head"} for r in lobo]),
+                        lobo_heads_chosen=[r["head"] for r in lobo],
+                        sum_heads_per_batch=summed,
+                        best_head_oracle=float(head_row.mean(0).max()))
+    return res
 
 
 def main():
@@ -197,20 +261,7 @@ def main():
 
     for b in range(agg.depth):
         blk = {"type": kinds[b]}
-        for qs in data[0]["mass"][b]:
-            # per batch, per head row AP (for leave-one-batch-out head choice)
-            head_row = np.array([[row_metrics(row_norm(d["mass"][b][qs][h]), d["G"])[0]
-                                  for h in range(d["mass"][b][qs].shape[0])] for d in data])   # (nb, H)
-            summed = [score_all(row_norm(d["mass"][b][qs].sum(0)), d["G"], d["O"]) for d in data]
-            lobo = []
-            for t in range(nb):
-                h = int(np.argmax(np.delete(head_row, t, 0).mean(0)))
-                lobo.append(dict(head=h, **score_all(row_norm(data[t]["mass"][b][qs][h]), data[t]["G"], data[t]["O"])))
-            blk[qs] = dict(sum_heads=mean_dict(summed),
-                           lobo_head=mean_dict([{k: v for k, v in r.items() if k != "head"} for r in lobo]),
-                           lobo_heads_chosen=[r["head"] for r in lobo],
-                           sum_heads_per_batch=summed,
-                           best_head_oracle=float(head_row.mean(0).max()))
+        blk.update(evaluate_scores(data, lambda d, key, b=b: d["mass"][b][key], data[0]["mass"][b].keys()))
         report["blocks"][b] = blk
     (args.out / "metrics.json").write_text(json.dumps(report, indent=1))
 
@@ -221,15 +272,19 @@ def main():
     bm = report["baseline"]["mean"]
     print(f"baseline depth overlap: row AP {bm['row_ap']:.3f} R-prec {bm['row_rprec']:.3f} | "
           f"batch AP {bm['batch_ap']:.3f} rho {bm['batch_rho']:.3f}")
-    print("\nblk type     | query  heads-summed: rowAP  Rprec batchAP  rho | LOBO head: rowAP batchAP")
+    cols = ["", "_qmax", "_max", ">cam", ">reg", ">patch"]
+    print("\nrow AP of the best head (leave-one-batch-out); pooling of a frame pair's token-to-token weights:")
+    print("  mean = sum over key tokens, mean over query tokens | qmax = max over query tokens | max = max over all")
+    print("  >cam/>reg/>patch = mean, only over the key frame's camera / register / patch tokens")
+    print("blk type     query |   mean   qmax    max   >cam   >reg >patch | heads summed (mean)")
     for b in range(agg.depth):
         blk = report["blocks"][b]
         for qs in ("cam", "reg", "patch"):
             if qs not in blk:
                 continue
-            s, l = blk[qs]["sum_heads"], blk[qs]["lobo_head"]
-            print(f"{b:3d} {blk['type']:8s} | {qs:5s}  {s['row_ap']:.3f}  {s['row_rprec']:.3f}  {s['batch_ap']:.3f}  "
-                  f"{s['batch_rho']:+.2f} | {l['row_ap']:.3f}  {l['batch_ap']:.3f}", flush=True)
+            vals = [f"{blk[qs + c]['lobo_head']['row_ap']:6.3f}" if qs + c in blk else "     -" for c in cols]
+            print(f"{b:3d} {blk['type']:8s} {qs:5s} | " + " ".join(vals) +
+                  f" | {blk[qs]['sum_heads']['row_ap']:.3f}", flush=True)
     print("\nper batch row AP (registers, heads summed) for register blocks + baseline:")
     print("      " + " ".join(f"{k:>8s}" for k in kind_names))
     print("base  " + " ".join(f"{r['row_ap']:8.3f}" for r in per_batch_base))

@@ -147,6 +147,55 @@ python scripts/export_gs_datasets.py --scene $SCENE --ba runs/ab5_gps_prior/ba_r
     --only ours --restrict-to runs/gs_HAV_fast/split.json
 ```
 
+### VGGT-Ω: two findings about what its layers do
+
+Details, the architecture and the earlier probes are in [docs/explicit_geometry_register.md](docs/explicit_geometry_register.md).
+
+**1. In the middle blocks, one attention head encodes the batch's covisibility graph.**
+
+Within a batch of 64 images, a single head's attention ranks each image's overlapping images ahead of the rest.
+- Score: attention mass from image i's query tokens to all tokens of image j, with the image's own frame dropped and rows renormalised.
+- Evaluation: compared, for each query image, with the Bentley tie-point graph (edge = ≥ 30 shared tie points). Reported as row AP, the mean over query images.
+- Data: 6 HAV batches. Heads are chosen on 5 batches and tested on the 6th.
+
+| Score | Row AP |
+|---|---|
+| Chance | ~0.18 |
+| Blocks 2 / 6 / 9 (early register blocks), best head | 0.23–0.29 |
+| Block 14 (register-only block), all 16 heads summed | 0.38 |
+| VGGT-Ω's final depth-reprojection overlap (what our graph builder uses) | 0.64 |
+| Block 14, register attention, head 15 | 0.70 |
+| Block 10, patch queries, head 3 | 0.73 |
+| **Block 13, patch queries, head 15** | **0.78** |
+| Block 15, patch queries, head 11 | 0.78 |
+
+- **The signal is patch-to-patch attention.** Restricting the keys to image j's patches gives the same AP. Its registers or camera token alone give ≤ 0.45.
+- **One head per block carries it.** The same head is chosen in every leave-one-batch-out split. Summing heads destroys it, and mean pooling beats max pooling.
+- **It is causal.** Removing only the cross-frame half of block 11, 12, 13 or 15 breaks the poses. Mean pair rotation error rises to 12–57° (intact 2.9°), and AUC@5 drops to ≤ 0.03 (intact 0.39). Removing one of blocks 18–22's cross-frame halves costs little (3.1–3.7°).
+- **Scope.** The scores are comparable only within a query image's row and within one batch. They don't work as cross-batch descriptors. So far this is measured on HAV only.
+
+**2. After block 17, each image's relative depth is fixed. The later blocks set its scale and the reference frame.**
+
+All 7 GauUscene scenes, 6 batches of 64 images each, compared with the intact model:
+- **Removing the cross-frame halves of blocks 18–22 changes each depth map by one scale factor per image.** The residual after that scale is 0.6–1.5% (p90 1.5–3.5%). One scale explains 98.8–99.7% of each image's log-depth variation (R²). Removing whole blocks 18–22 gives the same (residual 0.7–1.3%).
+- **Including block 17 breaks this.** The residual rises to 2.6–4.1% and R² falls to 0.93–0.96, with an offset-like distortion: a scale-plus-offset fit is about 3× better than scale alone.
+- **Per-image scale.** The late cross-frame attention sets each image's depth scale. Without it, depth shrinks to ×0.905–0.968, by a slightly different factor per image (1.8–3.9% spread). Agreement between the depth maps of overlapping views drops by 15–29%.
+- **Reference frame.** The late cross-frame attention keeps frame 0 at the world origin. Intact, frame 0 is within 0.16° of the identity. Without it, frame 0 is 7.5–15.5° off on average, up to 20° in a single batch.
+- **Camera scale.** The late per-frame attention sets the camera scale. Removing whole blocks 18–22 shrinks the camera layout to ×0.42–0.55 while the depth only changes by its scale.
+- **Mechanism (HAV).** From block 14 on, every image increasingly attends to frame 0 and its graph neighbourhood. At blocks 19–21, about two-thirds of each image's cross-frame attention goes to frame 0, while frame 0 attends mostly to itself (64–84%).
+
+![Depth with and without the cross-frame attention of blocks 18-22](docs/figures/egr_depth_scale_compare.png)
+
+```bash
+python scripts/egr_attention_mass.py --scene $SCENE           # finding 1: per-block, per-head attention probe
+python scripts/egr_block_removal.py --scene $SCENE            # pose error with blocks / cross-frame halves removed
+python scripts/egr_global_removal_depth.py --scene $SCENE --out runs/egr_global_removal_depth/<scene>   # finding 2
+python scripts/egr_depth_scale_viz.py --scene $SCENE --diverse --out runs/egr_depth_scale_viz_diverse  # figure + .ply
+python scripts/view_ply.py intact=<dir>/intact_by_image.ply removed=<dir>/removed_f0frame_by_image.ply \
+    --cameras intact=<dir>/cameras_intact.json removed=<dir>/cameras_removed_f0frame.json   # viser viewer
+python scripts/egr_frame0_attention_viz.py; python scripts/egr_late_heads_viz.py   # frame-0 attention, per head
+```
+
 ### Code map (implemented)
 
 | Module | Content |
@@ -167,7 +216,8 @@ python scripts/export_gs_datasets.py --scene $SCENE --ba runs/ab5_gps_prior/ba_r
 - Make VGGT densification part of the 3DGS export. Try denser lifting (stride 1–2), a cross-view consistency filter and other point budgets.
 - Harder benchmark: SZTU (1500 images) with RTK GPS, then consumer-grade GPS, then no GPS (time sequence only).
 - [Explicit geometry register](docs/explicit_geometry_register.md): store VGGT-Ω's camera and register tokens of each small batch in its scene-graph node, and merge nodes by running VGGT-Ω's camera head on the stored tokens of several nodes, instead of larger batches or GPS-guided linking. First step: a zero-shot merge test on HAV.
-- VGGT-Ω attention as the view-graph edge score ([EGR doc §8](docs/explicit_geometry_register.md#8-probe-which-attention-relates-images)). Confirm the block 13/14 head-15 probe on CUHK_LOWER and CUHK_UPPER, time the truncated forward pass, then build the graph from it within candidate batches.
+- VGGT-Ω attention as the view-graph edge score (finding 1 above; [EGR doc §8](docs/explicit_geometry_register.md#8-probe-which-attention-relates-images)). Confirm the block 13/14 head-15 probe on the other 6 GauUscene scenes, time the truncated forward pass, then build the graph from it within candidate batches.
+- Use finding 2: put the best-connected image first in each batch (frame 0 anchors the solution), and consider relative depth from block 17 with the scale taken from our BA.
 - Run on the other GauUscene scenes to check that the findings hold.
 
 ---

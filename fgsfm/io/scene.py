@@ -50,3 +50,20 @@ def load_reference_scene(root: str | Path, cache_dir: str | Path = "runs/cache",
     shared = shared_point_counts(obs_point, obs_image, len(xyz), len(graph))
     graph.set_all(normalize(shared, score).astype(np.float32))
     return ReferenceScene(root, graph, xyz, rgb, shared, obs_point, obs_image)
+
+
+def reference_covisibility(root: str | Path, cache_dir: str | Path = "runs/cache") -> tuple[list[str], np.ndarray]:
+    """(image names sorted, (N, N) shared AT tie-point counts) straight from AT-export.xml.
+
+    Unlike load_reference_scene it does not need points3D.ply to hold the tie points (some scenes ship a dense
+    cloud there); only the observations are used.
+    """
+    root = Path(root)
+    names = [im.name for im in ColmapModel.load(root / "sparse" / "0").sorted_images()]
+    scene_name = root.parent.name if root.name == "colmap_metrics" else root.name
+    tp = read_tie_points(root / "AT-export.xml", cache=Path(cache_dir) / f"{scene_name}_tiepoints.npz")
+    pos = {n: k for k, n in enumerate(names)}
+    photo_to_idx = {pid: pos[n] for pid, n in tp.photo_names.items() if n in pos}
+    keep = np.array([p in photo_to_idx for p in tp.obs_photo])
+    obs_image = np.array([photo_to_idx[p] for p in tp.obs_photo[keep]], np.int64)
+    return names, shared_point_counts(tp.obs_point[keep], obs_image, len(tp.xyz), len(names))

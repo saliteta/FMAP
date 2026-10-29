@@ -10,6 +10,9 @@ and evaluate initial vs refined poses against the COLMAP reference (eval only).
 
     python scripts/run_global_ba.py --scene /mnt/z/.../HAV/colmap_metrics \
         --ckpt runs/HAV_graph_v6_gps/ckpt/latest.pkl --out runs/HAV_ba_v1 --use-gps
+or from initial poses saved as a .npz (w2c with NaN rows for unplaced images, K and image_hw at model resolution,
+measured overlap + cobatched mask; e.g. scripts/egr_graph_stage_b.py):
+    python scripts/run_global_ba.py --scene ... --graph-npz runs/egr_graph_stage_b/SZTU/graph.npz --out ... --use-gps
 """
 from __future__ import annotations
 
@@ -27,6 +30,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fgsfm.ba.instantsfm_ba import reprojection_errors, run_global_ba
 from fgsfm.eval.pose_metrics import pose_metrics
 from fgsfm.geometry.transforms import centers, robust_umeyama
+from fgsfm.graph.view_graph import ViewGraph
+from fgsfm.io.colmap_text import ColmapModel
 from fgsfm.io.gps import gps_enu_for
 from fgsfm.io.scene import load_reference_scene
 from fgsfm.match.matcher import match_pairs
@@ -34,10 +39,47 @@ from fgsfm.match.sift import extract_features
 from fgsfm.match.tracks import build_tracks, subset, triangulate
 
 
+def per_image_budget(obs_img, n_images, budget):
+    """Longest tracks first; a track is kept while any of its images has fewer than `budget` kept tracks."""
+    count = np.zeros(n_images, int)
+    keep = np.zeros(len(obs_img), bool)
+    for t in np.argsort([-len(o) for o in obs_img], kind="stable"):
+        if (count[obs_img[t]] < budget).any():
+            keep[t] = True
+            count[obs_img[t]] += 1
+    return keep
+
+
+class NpzGraph:
+    """The parts of a builder SceneGraph that this script reads, from a .npz of initial poses: one frame holds
+    every placed image, and the pair scores are the measured overlap only (no keypoint-predicted overlap)."""
+    seed_frame = 0
+
+    def __init__(self, path):
+        d = np.load(path, allow_pickle=True)
+        self.names = [str(s) for s in d["names"]]
+        self.w2c, self.K, self.image_hw = d["w2c"], d["K"], tuple(int(x) for x in d["image_hw"])
+        self.measured, self.cobatched = d["measured"], d["cobatched"]
+        self.depth = self.depth_valid = [None] * len(self.names)
+        if "depth4" in d:                                    # stride-4 VGGT depth for fgsfm/geometry/densify.py
+            ok = np.isfinite(self.w2c[:, 0, 0])
+            self.depth = [x.reshape(-1).astype(np.float64) if o else None for x, o in zip(d["depth4"], ok)]
+            self.depth_valid = [x.reshape(-1) if o else None for x, o in zip(d["valid4"], ok)]
+        self._cams = np.flatnonzero(np.isfinite(self.w2c[:, 0, 0]))
+
+    def cams_in(self, frame):
+        return self._cams
+
+    def predicted_overlap(self, frame):
+        return self._cams, np.zeros((len(self._cams), len(self._cams)))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", type=Path, required=True)
-    ap.add_argument("--ckpt", type=Path, required=True)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--ckpt", type=Path, help="graph builder checkpoint")
+    src.add_argument("--graph-npz", type=Path, help="initial poses + measured overlap (see NpzGraph)")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--use-gps", action="store_true", help="express the graph in meters via GPS before BA")
     ap.add_argument("--match-width", type=int, default=2736, help="SIFT image width (full res = 5472)")
@@ -56,6 +98,9 @@ def main():
     ap.add_argument("--filter-px", type=str, default="16,8,4")
     ap.add_argument("--fix-intrinsics", action="store_true")
     ap.add_argument("--max-tracks", type=int, default=0, help="subsample tracks for BA (0 = all)")
+    ap.add_argument("--tracks-per-image", type=int, default=0,
+                    help="> 0: keep the longest tracks until every image has this many (GLOMAP-style budget; "
+                         "bounds BA memory by the number of images)")
     ap.add_argument("--min-track-len", type=int, default=3,
                     help="drop tracks seen in fewer images (default 3: no 2-view tracks; BA 5x faster, same accuracy)")
     ap.add_argument("--ba-ftol", type=float, default=5e-4, help="LM relative-improvement stopping tolerance")
@@ -73,15 +118,19 @@ def main():
     t0 = time.time()
 
     # ---- reference (evaluation only) + graph checkpoint
-    scene = load_reference_scene(args.scene)
-    ref = scene.graph.cameras
+    try:
+        ref = load_reference_scene(args.scene).graph.cameras
+    except ValueError:                 # points3D.ply is not the AT tie points (e.g. CUHK_LOWER); poses suffice here
+        ref = ViewGraph.from_colmap(ColmapModel.load(args.scene / "sparse" / "0")).cameras
     names = [c.name for c in ref]
-    with open(args.ckpt, "rb") as f:
-        state = pickle.load(f)
-    g = state["graph"]
+    if args.ckpt is not None:
+        with open(args.ckpt, "rb") as f:
+            g = pickle.load(f)["graph"]
+    else:
+        g = NpzGraph(args.graph_npz)
     assert g.names == names
     cams = g.cams_in(g.seed_frame)
-    print(f"checkpoint {args.ckpt}: {len(cams)}/{len(names)} cameras in the seed frame", flush=True)
+    print(f"graph {args.ckpt or args.graph_npz}: {len(cams)}/{len(names)} cameras in the seed frame", flush=True)
 
     # ---- initial poses in meters (GPS) and full-resolution intrinsics (VGGT, shared camera)
     w2c0 = g.w2c[cams].copy()
@@ -188,6 +237,9 @@ def main():
     if args.min_track_len > 2:
         tracks = subset(tracks, np.array([len(o) >= args.min_track_len for o in tracks.obs_img]))
         print(f"  kept {len(tracks)} tracks with >= {args.min_track_len} views", flush=True)
+    if args.tracks_per_image > 0:
+        tracks = subset(tracks, per_image_budget(tracks.obs_img, len(cams), args.tracks_per_image))
+        print(f"  kept {len(tracks)} longest tracks for a budget of {args.tracks_per_image} per image", flush=True)
     if args.max_tracks and len(tracks) > args.max_tracks:
         sel = np.random.default_rng(0).choice(len(tracks), args.max_tracks, replace=False)
         m = np.zeros(len(tracks), bool)
@@ -235,7 +287,7 @@ def main():
                         obs_per_image=np.bincount(obs_img, minlength=len(cams)))
     (args.out / "metrics.json").write_text(json.dumps(dict(intrinsics_mode=args.intrinsics,
         K_final=out.K.tolist(), K_ref=ref[cams[0]].K.tolist(),
-        ckpt=str(args.ckpt), use_gps=args.use_gps, match_width=args.match_width, features=args.features, ratio=args.ratio, pairs=len(pairs),
+        ckpt=str(args.ckpt or args.graph_npz), use_gps=args.use_gps, match_width=args.match_width, features=args.features, ratio=args.ratio, pairs=len(pairs),
         verified_pairs=len(matches), tracks_initial=len(tracks), ba_stages=dict(reproj=out.reproj_px, tracks=out.num_tracks),
         before=before, after=after, focal=dict(init=K0[0, 0], ba=out.K[0, 0], ref=ref[0].K[0, 0]), time=T),
         indent=1, default=float))

@@ -196,6 +196,39 @@ python scripts/view_ply.py intact=<dir>/intact_by_image.ply removed=<dir>/remove
 python scripts/egr_frame0_attention_viz.py; python scripts/egr_late_heads_viz.py   # frame-0 attention, per head
 ```
 
+### All 7 GauUscene scenes: VGGT-Ω graph → global BA → 3DGS
+
+Pipeline (`scripts/run_stage_ab.py` → `scripts/run_global_ba.py` → `scripts/export_gs_datasets.py` → gsplat):
+- **A. Graph build:** VGGT-Ω blocks 0–13 on GPS spatial cells of 64 images. Each image's top 6 by block 13 head 15 attention (finding 1) give the graph.
+- **B. Initial poses (aerial triangulation):** the graph is covered by overlapping clusters of 64. Full VGGT-Ω runs once per cluster, with the cluster's central image as frame 0. Each cluster is fitted straight onto EXIF GPS by a Sim(3).
+- **C. Bundle adjustment:** RootSIFT matching on graph edges, then tracks and global BA (`--use-gps --tracks-per-image 800`). SIFT extraction runs on the CPU during A and B, so it adds no time.
+- **Dense:** gsplat 1.5.1, 30k steps, 1600 px images, every 8th image held out. The starting cloud has 2M points: BA tracks plus VGGT-Ω depth corrected per training image by the tracks.
+
+Wall clock in seconds, one 24 GB GPU; PSNR on held-out views; single training runs:
+
+| Scene | Images | A. Graph build | B. Initial poses | C. Bundle adjustment | **Sparse total** | Dense: 3DGS training | **End to end** | **PSNR** |
+|---|---|---|---|---|---|---|---|---|
+| HAV | 424 | 203* | 61 | 141 | **405*** | 2554 (42.6 min) | 49.3 min | **24.45** |
+| CUHK_LOWER | 670 | 96 | 89 | 161 | **346** | 2011 (33.5 min) | 39.3 min | **24.27** |
+| CUHK_UPPER | 715 | 92 | 106 | 170 | **367** | 2419 (40.3 min) | 46.4 min | **24.24** |
+| LFLS | 1106 | 122 | 137 | 265 | **524** | 1958 (32.6 min) | 41.4 min | **21.13** |
+| SMBU | 829 | 109 | 99 | 225 | **432** | 2237 (37.3 min) | 44.5 min | **24.18** |
+| SZIIT | 1215 | 135 | 149 | 253 | **537** | 2017 (33.6 min) | 42.6 min | **23.05** |
+| SZTU | 1500 | 167 | 192 | 484 | **843** | 2309 (38.5 min) | 52.5 min | **22.24** |
+
+- \* HAV ran with nothing cached in memory: loading the code and the model took about 140 s, against about 24 s on the other scenes. With a warm cache its sparse total is about 290 s.
+- **A** includes process start, loading the 512 px images (15–34 s) and the VGGT-Ω model (about 22 s). **C** includes matching (34–116 s), tracks (19–74 s) and BA (57–273 s). **Dense** includes evaluation and the trajectory video (about 2 min), but not the export (1600 px resize and densification, about 1–3 min).
+- **HAV** uses the same 52 test views as the section above. There, the earlier pipeline reached 24.37 and COLMAP + GPS 24.25. The other scenes have no baseline yet.
+- **Poses after BA** against the Bentley AT: median relative rotation error 0.026–0.041°, median camera position error 5–13 cm, every image placed on every scene.
+- **LFLS** was flown on several dates. Its test views from 2024-03-07 average 21.7 dB with cameras 4.5 cm off (median); the 9 test views from 2024-02-23 average 16.9 dB.
+
+```bash
+python scripts/run_stage_ab.py --scene $SCENE --out runs/stage_ab_gps/<scene> --sift-cache runs/stage_ab_gps/<scene>/sift
+python scripts/run_global_ba.py --scene $SCENE --graph-npz runs/stage_ab_gps/<scene>/graph.npz --out runs/stage_ab_gps/<scene>/ba \
+    --use-gps --tracks-per-image 800 --sift-cache runs/stage_ab_gps/<scene>/sift
+python scripts/export_gs_datasets.py --scene $SCENE --ba runs/stage_ab_gps/<scene>/ba/ba_result.npz --out runs/stage_ab_gps/<scene>/gs --only ours
+```
+
 ### Code map (implemented)
 
 | Module | Content |

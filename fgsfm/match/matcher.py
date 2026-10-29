@@ -35,7 +35,10 @@ def match_pairs(feats: list[dict], pairs: list[tuple[int, int]], ratio: float = 
     def verify(item):
         (i, j), m = item
         p1, p2 = feats[i]["xy"][m[:, 0]], feats[j]["xy"][m[:, 1]]
-        F, mask = cv2.findFundamentalMat(p1, p2, cv2.USAC_MAGSAC, ransac_px, 0.999, 10000)
+        try:
+            F, mask = cv2.findFundamentalMat(p1, p2, cv2.USAC_MAGSAC, ransac_px, 0.999, 10000)
+        except cv2.error:              # USAC asserts on degenerate sets (e.g. all matches on one plane / line)
+            return (i, j), None
         if F is None or mask is None:
             return (i, j), None
         inl = mask.ravel().astype(bool)

@@ -188,8 +188,13 @@ def main():
         xyz, rgb = xyz[keep], rgb[keep]
         if args.dense_points > len(xyz):
             ckpt = args.ckpt or Path(json.loads((args.ba.parent / "metrics.json").read_text())["ckpt"])
-            with open(ckpt, "rb") as f:
-                graph = pickle.load(f)["graph"]
+            if ckpt.suffix == ".npz":                        # scripts/run_stage_ab.py graph
+                sys.path.insert(0, str(Path(__file__).resolve().parent))
+                from run_global_ba import NpzGraph
+                graph = NpzGraph(ckpt)
+            else:
+                with open(ckpt, "rb") as f:
+                    graph = pickle.load(f)["graph"]
             train = {n for i, n in enumerate(names) if i % 8 != 0}
             dx, dc, rep = lift_vggt_points(d, graph, train, img_dir)
             errs = [r["held_out_rel_depth_err"] for r in rep.values()]

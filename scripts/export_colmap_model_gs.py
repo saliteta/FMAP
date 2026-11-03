@@ -28,12 +28,26 @@ def main():
     ap.add_argument("--split", type=Path, required=True, help="split.json with the image list to use")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--images", type=Path, default=Path("runs/gs_HAV/images"), help="shared 1600 px images")
+    ap.add_argument("--allow-missing", action="store_true",
+                    help="drop unregistered images; prefix names so the remaining test images (every 8th of the "
+                         "split) stay on gsplat's every-8th test slots")
     args = ap.parse_args()
     names = json.loads(args.split.read_text())["names"]
     cams = read_cameras_text(args.model / "cameras.txt")
     imgs = {im.name: im for im in read_images_text(args.model / "images.txt").values()}
     missing = [n for n in names if n not in imgs]
-    assert not missing, f"{len(missing)} images missing in the model: {missing[:5]}"
+    assert not missing or args.allow_missing, f"{len(missing)} images missing in the model: {missing[:5]}"
+    rename = {}
+    if missing:
+        test = [n for i, n in enumerate(names) if i % 8 == 0 and n in imgs]
+        train = [n for i, n in enumerate(names) if i % 8 != 0 and n in imgs]
+        assert 7 * (len(test) - 1) <= len(train) <= 7 * len(test), "test slots cannot be preserved"
+        order = [x for k, t in enumerate(test) for x in [t] + train[7 * k:7 * k + 7]]
+        rename = {n: f"{i:05d}_{n}" for i, n in enumerate(order)}
+        names = order
+        (args.out).mkdir(parents=True, exist_ok=True)
+        (args.out / "rename.json").write_text(json.dumps(dict(missing=missing, rename=rename), indent=1))
+        print(f"dropped {len(missing)} unregistered images ({sum(names.index(n) % 8 == 0 for n in test)} test kept)")
     assert len(cams) == 1, "expects one shared camera"
     c = list(cams.values())[0]
     p = c.params
@@ -53,13 +67,18 @@ def main():
         rgb.append([int(v) for v in e[4:7]])
     sp = args.out / "sparse/0"
     sp.mkdir(parents=True, exist_ok=True)
-    if not (args.out / "images").exists():
+    if rename:
+        (args.out / "images").mkdir(exist_ok=True)
+        for n, r in rename.items():
+            if not (args.out / "images" / r).exists():
+                (args.out / "images" / r).symlink_to((args.images / n).resolve())
+    elif not (args.out / "images").exists():
         (args.out / "images").symlink_to(args.images.resolve())
     images = []
     for i, n in enumerate(names):
         T = np.eye(4)
         T[:3, :3], T[:3, 3] = imgs[n].R, imgs[n].tvec
-        images.append((i + 1, T, 1, n))
+        images.append((i + 1, T, 1, rename.get(n, n)))
     write_cameras_bin(sp / "cameras.bin", [(1, c.width, c.height, np.array([fx, fy, cx, cy]))])
     write_images_bin(sp / "images.bin", images)
     write_points_ply(sp / "points3D.ply", np.array(xyz), np.array(rgb, np.uint8))

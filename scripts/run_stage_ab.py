@@ -34,7 +34,8 @@ from fgsfm.geometry.densify import STRIDE as DENSE_STRIDE  # noqa: E402
 from fgsfm.fm.overlap import batch_geometry, symmetric_overlap  # noqa: E402
 from fgsfm.geometry.transforms import to4x4  # noqa: E402
 from fgsfm.io.colmap_text import ColmapModel  # noqa: E402
-from fgsfm.io.gps import gps_enu_for  # noqa: E402
+from fgsfm.graph.islands import repair  # noqa: E402
+from fgsfm.io.gps import flights_for, gimbal_w2c_for, gps_enu_for  # noqa: E402
 from fgsfm.match.sift import extract_features  # noqa: E402
 from vggt_omega.models import VGGTOmega  # noqa: E402
 from vggt_omega.utils.pose_enc import encoding_to_camera  # noqa: E402
@@ -46,6 +47,13 @@ def main():
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--positions", choices=("gps", "reference"), default="gps",
                     help="camera positions for the stage-A spatial cells: EXIF GPS, or the reference AT centres")
+    ap.add_argument("--no-island-repair", action="store_true", help="skip the island search (fgsfm/graph/islands.py)")
+    ap.add_argument("--island-overlap", type=float, default=0.05,
+                    help="measured overlap that counts as a pair-graph edge (run_global_ba.py --topk-min-overlap)")
+    ap.add_argument("--no-flight-offsets", action="store_true",
+                    help="trust every flight's GPS as is (default: per-flight offsets when gps.npz has 'flight')")
+    ap.add_argument("--no-gimbal", action="store_true",
+                    help="ignore DJI gimbal angles in gps.npz (default: rotation prior for the GPS merge when present)")
     ap.add_argument("--merge", choices=("gps", "chain"), default="gps",
                     help="clusters into one frame: each straight onto EXIF GPS, or chained by shared cameras")
     ap.add_argument("--batch", type=int, default=64)
@@ -131,7 +139,8 @@ def main():
     clusters = cover(adj, n, args.batch)
     t = tick("clustering", t)
     measured, cobatched = np.zeros((n, n)), np.zeros((n, n), bool)
-    for C in clusters:
+
+    def run_cluster(C):
         x = images[C["images"]].float().cuda()
         with torch.inference_mode():
             pred = model(x[None])
@@ -151,12 +160,50 @@ def main():
         ix = np.ix_(C["images"], C["images"])
         measured[ix] = np.maximum(measured[ix], symmetric_overlap(geo.covis).cpu().numpy())
         cobatched[ix] = True
+
+    for C in clusters:
+        run_cluster(C)
+    torch.cuda.synchronize()
+    t = tick("stage B inference", t)
+
+    # ---- no isolated islands (fgsfm/graph/islands.py): the pair graph of run_global_ba.py is measured overlap
+    # >= --island-overlap between co-batched images; search each island with its GPS neighbours, widening to all
+    bridge = np.zeros((n, n), bool)
+    discarded = np.zeros(n, bool)
+    if not args.no_island_repair:
+        half = args.batch // 2
+
+        def search(part, cand):
+            order = [int(part[0])] + [int(v) for v in part[1:]] + [int(v) for v in cand[:args.batch - len(part)]]
+            C = dict(images=order, hops=[-1] * len(part) + [99] * (len(order) - len(part)), repair=True)
+            run_cluster(C)                                    # island images prefer this batch for placement
+            clusters.append(C)
+            cand_used = np.array(order[len(part):])
+            new = measured[np.ix_(part, cand_used)] >= args.island_overlap
+            bridge[np.ix_(part, cand_used)] |= new
+            bridge[np.ix_(cand_used, part)] |= new.T
+            return cobatched & (measured >= args.island_overlap)
+
+        _, discarded, island_report = repair(cobatched & (measured >= args.island_overlap), P, search,
+                                             step=args.batch - half, max_island_part=half)
+        T["islands"] = island_report
+        torch.cuda.synchronize()
+        t = tick("island repair", t)
     torch.cuda.synchronize()
     t = tick("stage B inference", t)
     if args.merge == "gps":
-        w2c, K, src, links, n_merged = merge_gps(clusters, n, gps)
+        gimbal = None if args.no_gimbal else gimbal_w2c_for(names, args.scene / "AT-export.xml")
+        flights = None if args.no_flight_offsets else flights_for(names, args.scene / "AT-export.xml")
+        w2c, K, src, links, n_merged = merge_gps(clusters, n, gps, gimbal=gimbal, flights=flights)
+        if gimbal is not None:
+            ng = sum(bool(l.get("gimbal")) for l in links)
+            print(f"merge: gimbal rotation prior on, {ng} / {len(links)} clusters placed with the gimbal rotation", flush=True)
     else:
         w2c, K, src, links, n_merged = merge(clusters, n)
+    if discarded.any():                                        # islands that never linked: not in the model
+        w2c[discarded] = np.nan
+        src[discarded] = -1
+        print(f"discarded {int(discarded.sum())} images in unlinked islands", flush=True)
     depth4 = np.zeros((n,) + clusters[0]["depth4"].shape[1:], np.float16)
     valid4 = np.zeros(depth4.shape, bool)
     for g, (ci, k) in enumerate(src):
@@ -164,8 +211,10 @@ def main():
             depth4[g], valid4[g] = clusters[ci]["depth4"][k], clusters[ci]["valid4"][k]
     np.fill_diagonal(cobatched, False)
     np.savez(args.out / "graph.npz", w2c=w2c, K=K, image_hw=np.array(images.shape[-2:]), measured=measured,
-             cobatched=cobatched, names=np.array(names), depth4=depth4, valid4=valid4,
-             clusters=np.array([np.array(c["images"]) for c in clusters], dtype=object))
+             cobatched=cobatched, bridge=bridge, discarded=discarded, names=np.array(names), depth4=depth4, valid4=valid4,
+             clusters=np.array([np.array(c["images"]) for c in clusters], dtype=object),
+             cluster_w2c=np.array([c["w2c"] for c in clusters], dtype=object),       # raw VGGT-Omega poses, so the
+             cluster_hops=np.array([np.array(c["hops"]) for c in clusters], dtype=object))  # merge can be redone
     t = tick("merge + save", t)
     if args.sift_cache is not None:
         th.join()

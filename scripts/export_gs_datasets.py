@@ -99,6 +99,8 @@ def main():
                     help="ours: drop points whose max triangulation angle (deg) is below this")
     ap.add_argument("--dense-points", type=int, default=2_000_000,
                     help="ours: total initial points, BA tracks + VGGT depth corrected by the tracks (0 = tracks only)")
+    ap.add_argument("--lift-all", action="store_true",
+                    help="also lift the test images (for a visualization point cloud; not for a 3DGS evaluation)")
     ap.add_argument("--ckpt", type=Path, default=None,
                     help="graph checkpoint holding the VGGT depths (default: the 'ckpt' in the BA's metrics.json)")
     args = ap.parse_args()
@@ -195,7 +197,7 @@ def main():
             else:
                 with open(ckpt, "rb") as f:
                     graph = pickle.load(f)["graph"]
-            train = {n for i, n in enumerate(names) if i % 8 != 0}
+            train = {n for i, n in enumerate(names) if i % 8 != 0 or args.lift_all}
             dx, dc, rep = lift_vggt_points(d, graph, train, img_dir)
             errs = [r["held_out_rel_depth_err"] for r in rep.values()]
             sel = voxel_subsample(dx, args.dense_points - len(xyz))

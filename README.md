@@ -4,21 +4,137 @@
 
 ---
 
-## 0. Current status and quickstart
+## How to run
 
-Implemented so far: the **reference view graph** (Stage 0) with an interactive viewer, and a first **VGGT batch-overlap** experiment (Stages 1–2), evaluated against the reference. Everything from §1 onward is the design that the remaining work follows.
+The working pipeline turns drone photos with GPS into camera poses (sparse reconstruction), then trains 3D Gaussian splatting (3DGS) on them:
 
-### Setup
+```
+photos + GPS ─► A. graph build ─► B. initial poses ─► C. matching + bundle adjustment ─► 3DGS export ─► gsplat
+                (run_stage_ab.py: VGGT-Ω)            (run_global_ba.py)                (export_gs_datasets.py)
+                                  island repair       island repair,
+                                  per-flight GPS      rotation averaging,
+                                  offsets             Schur BA
+```
+
+Results: [All 7 GauUscene scenes](#all-7-gauuscene-scenes-vggt-ω-graph--global-ba--3dgs) (424–1500 images) and [FeihongBuilding](#feihongbuilding-3732-images-8-flights-consumer-gps) (3732 images, 8 flights, consumer GPS). One 24 GB GPU is enough for 3732 images with the Schur solver; 32 GB or more of RAM is recommended.
+
+### 1. Install
 
 ```bash
-git clone --recursive https://github.com/saliteta/FMAP.git   # VGGT is a submodule in third_party/vggt
+git clone --recursive https://github.com/saliteta/FMAP.git   # submodules: third_party/{vggt, vggt_omega, InstantSfM}
 cd FMAP
 conda create -n fgsfm python=3.11 -y && conda activate fgsfm
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements.txt
+pip install -e third_party/vggt_omega
+# bundle adjustment (bae + InstantSfM); install without dependency resolution so torch stays at cu124:
+conda install -c "nvidia/label/cuda-12.4.1" cuda-toolkit -y          # nvcc for bae's CUDA extensions
+pip install --no-deps "git+https://github.com/pypose/pypose.git"
+pip install pyceres warp-lang "nvidia-cudss-cu12==0.7.1.6"           # cuDSS 0.8 segfaults with bae at scale
+CUDA_HOME=$CONDA_PREFIX pip install --no-deps --no-build-isolation "git+https://github.com/sair-lab/bae.git"
+hf auth login                                                        # VGGT-Ω weights: facebook/VGGT-Omega
 ```
 
-VGGT weights (`facebook/VGGT-1B`, ~5 GB) download on first use. Check the checkpoint license before commercial use.
+- **Licenses:** VGGT-Ω weights are under the FAIR Noncommercial Research License and InstantSfM under CC BY-NC 4.0, so this setup is for research only.
+- **3DGS environment:** a separate env with `gsplat==1.5.1` and the requirements of its `examples/` folder. Copy gsplat 1.5.1's `examples/` to `runs/gsplat_v151/examples`; the commands below run `simple_trainer.py` from there.
+- **Baselines:** COLMAP 4.2.1 (for `global_mapper`, i.e. GLOMAP), e.g. `conda create -n colmap -c conda-forge colmap=4.2.1`.
+
+### 2. Data layout
+
+Each scene is a folder `<scene>/colmap_metrics/`:
+
+| Path | Needed for | Content |
+|---|---|---|
+| `images/` | everything | undistorted JPEGs, one camera |
+| `sparse/0/cameras.txt`, `images.txt` | everything | COLMAP text model. Gives the image list, and the reference poses for the evaluation printouts. |
+| `AT-export.xml` **or** `gps.npz` | GPS | GPS per image: GauUscene's Bentley export, or `names` + `lla` (lat, lon, ellipsoidal altitude) arrays. Optional in `gps.npz`: `flight` (GPS session per image, enables per-flight offsets) and `yaw_pitch` (gimbal angles, enables the gimbal prior). |
+
+**GauUscene** scenes already have this layout.
+
+**Raw DJI photos** (Mavic 3E, Matrice …) are converted by one script:
+- It undistorts with the lens calibration stored in each photo and reads GPS from the photo metadata.
+- It writes `gps.npz` with each photo's flight (its source subfolder) and gimbal yaw / pitch.
+- It writes a stand-in reference from GPS + gimbal angles. Pose metrics printed against it are only meter / degree level; compare against GLOMAP instead.
+
+```bash
+python scripts/prepare_dji_scene.py --src <folder with the DJI JPGs, subfolders allowed> --out <scene>/colmap_metrics
+```
+
+### 3. Sparse reconstruction (A + B + C)
+
+```bash
+conda activate fgsfm
+SCENE=/path/to/<scene>/colmap_metrics; O=runs/<name>
+python scripts/run_stage_ab.py  --scene $SCENE --out $O --sift-cache $O/sift
+python scripts/run_global_ba.py --scene $SCENE --graph-npz $O/graph.npz --out $O/ba --use-gps \
+    --tracks-per-image 800 --sift-cache $O/sift --ba-solver schur
+```
+
+| Step | Script | Writes | Notes |
+|---|---|---|---|
+| A + B | `run_stage_ab.py` | `$O/graph.npz` (initial poses, VGGT-Ω depth, raw per-cluster poses), `$O/stage_ab.json` (times, metrics, merge links, islands) | Also extracts RootSIFT into `$O/sift` on a CPU thread. Caches 512 px images in `runs/cache/vggt_omega512_<scene>.pt` (`--cache`); delete it if the images change. |
+| C | `run_global_ba.py` | `$O/ba/ba_result.npz` (poses, intrinsics, tracks), `$O/ba/metrics.json` | Matches graph edges, repairs islands, averages rotations, triangulates, then BA in three filter stages (16, 8, 4 px). Matches and tracks are cached in `$O/ba/tracks_*.pkl`, so a rerun skips matching. |
+
+What the steps do, in order:
+1. **Per-flight GPS offsets** (B, `merge_gps`): every flight is its own GPS session, and its altitude can be off by metres (17 m spread on FeihongBuilding). The clusters that contain images of several flights give one 3D offset per flight, and every camera is placed on the corrected GPS. Needs `flight` in `gps.npz`.
+2. **Island repair** (B and C, `fgsfm/graph/islands.py`): no image group may be disconnected from the rest. After stage B, each island of the VGGT overlap graph is run through VGGT-Ω together with its GPS-nearest images, widening the search until it links (up to every image) or is discarded. After matching, the same search runs on the SIFT-verified pairs, with a lower inlier floor for these bridge pairs.
+3. **Rotation averaging** (C, `fgsfm/geometry/rotation_averaging.py`): each verified pair gives a relative rotation (essential matrix), and all camera rotations are solved together (smoothed L1, then Cauchy). This fixes whole clusters that stage B rotated by a few degrees; BA cannot, because their cross-cluster tracks fail the triangulation filter. About 50 s at 3732 images.
+4. **Schur BA** (`--ba-solver schur`, `fgsfm/ba/schur.py`): eliminates the 3D points and solves the camera system matrix-free with PCG. GPU memory grows with observations only (about 3 GB per million), against roughly 13 GB per million for the default `lm`, which builds the full JᵀJ.
+
+Both scripts print pose metrics against `sparse/0` at the end. These are computed after the timer stops.
+
+Main options:
+- **`--use-gps`:** scales and places the result in meters (ENU) from GPS. `--gps-prior-sigma <m>` also adds a camera-centre prior inside BA.
+- **`--tracks-per-image`:** caps the BA problem. Longest tracks are kept until every image has this many. With `--ba-solver schur`, 800 fits 3732 images in 11 GB of GPU memory; with `lm` it fits about 1500.
+- **Switching steps off:** `--no-island-repair` (both scripts), `--no-rotation-averaging` (`run_global_ba.py`), `--no-flight-offsets` (`run_stage_ab.py`). `--island-step` (40) and `--bridge-min-inliers` (15) tune the search after matching.
+- **`--no-gimbal`** (A + B): the gimbal prior is on when `gps.npz` has `yaw_pitch`. A cluster whose GPS-fitted rotation is more than 5° from the gimbal rotation takes the gimbal one. With island repair and rotation averaging it is a safety net, not needed.
+- **`--merge chain`** (stage B): links clusters by shared images instead of fitting each cluster to GPS. Use it for weak GPS, but drift is larger.
+
+### 4. 3DGS
+
+```bash
+python scripts/export_gs_datasets.py --scene $SCENE --ba $O/ba/ba_result.npz --out $O/gs --only ours
+cd runs/gsplat_v151/examples && <gsplat env>/bin/python simple_trainer.py default --data_dir $PWD/../../../$O/gs/ours \
+    --data_factor 1 --test_every 8 --result_dir $PWD/../../../$O/gs/results --disable_viewer
+```
+
+- **Export:** resizes to 1600 px and drops images with fewer than 20 BA observations. It starts 3DGS from 2M points: BA tracks plus VGGT-Ω depth corrected per training image (`--dense-points 0` = tracks only). `$O/gs/split.json` lists the images.
+- **Training:** every 8th image (sorted by name) is a test view. PSNR / SSIM / LPIPS land in `$O/gs/results/stats/val_step29999.json`.
+
+**Dense point cloud for viewing** (not for a 3DGS evaluation, since test images are lifted too):
+
+```bash
+python scripts/export_gs_datasets.py --scene $SCENE --ba $O/ba/ba_result.npz --out $O/export --only ours \
+    --dense-points 20000000 --lift-all                                     # 20M points: $O/export/ours/sparse/0/points3D.ply
+python scripts/filter_ply.py $O/export/ours/sparse/0/points3D.ply --ba $O/ba/ba_result.npz --out $O/dense   # -> $O/dense_kept.ply
+python scripts/view_ply.py cloud=$O/dense_kept.ply --up +z --max-points 5000000 --point-size 0.08 --port 8080
+```
+
+`filter_ply.py` drops points whose 16 nearest neighbours are farther than max(0.8 m, 0.1 × distance to the nearest camera), so distant geometry is kept while floaters near the cameras go. `view_ply.py` also takes camera sets (`--cameras name=cameras.json`) and lists per-camera pose differences between the first two.
+
+### 5. Baselines (GLOMAP = COLMAP 4.2.1 `global_mapper`)
+
+```bash
+C=colmap; DB=runs/<name>/glomap/database.db
+$C feature_extractor --database_path $DB --image_path $SCENE/images --ImageReader.single_camera 1 --FeatureExtraction.use_gpu 1
+# write GPS pose priors (and a focal prior) into the database, then match:
+$C spatial_matcher    --database_path $DB --FeatureMatching.use_gpu 1        # GPS: 50 nearest within 100 m
+# or: $C exhaustive_matcher --database_path $DB --FeatureMatching.use_gpu 1   # all pairs; O(N²)
+$C global_mapper --database_path $DB --image_path $SCENE/images --output_path runs/<name>/glomap/sparse \
+    --GlobalMapper.ba_refine_principal_point 1
+python scripts/eval_colmap_model.py      --scene $SCENE --model runs/<name>/glomap/sparse/0      # same pose metrics
+python scripts/export_colmap_model_gs.py --model runs/<name>/glomap/sparse/0_txt --split $O/gs/split.json \
+    --out runs/<name>/glomap/gs --images $O/gs/images [--allow-missing]                         # same 3DGS split
+```
+
+- **Priors:** the GPS pose priors go into the `pose_priors` table and the focal prior into `cameras`; see `set_priors.py` in the GLOMAP comparison runs. Use σ ≈ 0.05 m for RTK and a few meters for consumer GPS.
+- **GPU:** our COLMAP build's Ceres has no cuDSS, so GLOMAP's global positioning and BA run on the CPU.
+
+---
+
+## 0. Current status
+
+Implemented and benchmarked: the pipeline in [How to run](#how-to-run), on 7 GauUscene scenes against Bentley AT and GLOMAP. Earlier parts are still here: the **reference view graph** (Stage 0) with an interactive viewer, and the first **VGGT batch-overlap** experiment (Stages 1–2). Everything from §1 onward is the design that the remaining work follows.
 
 ### Data
 
@@ -229,6 +345,46 @@ python scripts/run_global_ba.py --scene $SCENE --graph-npz runs/stage_ab_gps/<sc
 python scripts/export_gs_datasets.py --scene $SCENE --ba runs/stage_ab_gps/<scene>/ba/ba_result.npz --out runs/stage_ab_gps/<scene>/gs --only ours
 ```
 
+### FeihongBuilding (3732 images, 8 flights, consumer GPS)
+
+A harder DJI M3E capture: 3732 photos at 5280×3956 in 8 flights (two 50 m grids, a 40 m grid, two orbits, three ground-level flights at 5–16 m), consumer GPS without RTK, every view oblique. There is no ground-truth model, so poses are compared against GLOMAP + GPS-guided matching (COLMAP 4.2.1, independent of our GPS handling), aligned to ours by a similarity on the camera centres.
+
+Each fix below was added after inspecting the previous result (camera pose viewer, per-flight statistics):
+
+| Pipeline | Cameras exported | Rotation vs GLOMAP, median | > 5° | > 20° | Centre vs GLOMAP, median | > 5 m |
+|---|---|---|---|---|---|---|
+| A + B + C (Schur BA, 800 tracks/image) | 3685 | 0.14° | 174 | 26 | 0.14 m | 247 |
+| + gimbal prior (DJI only) | 3700 | 0.11° | 8 | 0 | 0.09 m | 93 |
+| + island repair, no gimbal | 3684 | 0.13° | 158 | 0 | 0.12 m | 270 |
+| + rotation averaging | 3697 | 0.08° | 0 | 0 | 0.08 m | 74 |
+| **+ per-flight GPS offsets** (current) | **3711** | **0.06°** | 5 | 0 | **0.05 m** | **8** |
+
+- **Islands:** a 20-image ground-level segment was its own VGGT-Ω cluster, with no candidate pair to anything else. Its GPS track is nearly a line, so the cluster came out rolled by 170°; BA kept it (self-consistent at 0.5 px). Island repair links all 6 islands within the first batch of GPS neighbours (11 s at stage B, 14 s after matching); GLOMAP's spatial matching had found 116 bridge pairs for that segment.
+- **Rotation averaging:** whole clusters rotated 5–20° remained after island repair. Averaging over 39.8k verified pairs brings the initial rotations from 524 to 3 cameras off by more than 5° before BA.
+- **Per-flight GPS offsets:** absolute minus relative altitude (the implied take-off height) spans 60–77 m between flights. Three flights read 10–16 m low. BA lifted the well-connected cameras, but 43 weakly connected ground-level cameras stayed at the GPS height, and their VGGT points formed a second ground surface 13 m below the real one. The estimated offsets (+10.2, +14.1, +16.3 m) match the BA and GLOMAP heights. 2 m columns near that flight with a point layer more than 6 m below the bulk went from 40% to 10%.
+- **Schur BA:** the default `lm` builds JᵀJ over cameras and every point. At 800 tracks per image (3.4M observations) it would need an estimated 46 GB of GPU memory (17.8 GB measured at 1.3M); on WSL that spills into system RAM and took the machine down. Schur BA ran the same problem in 11.4 GB and gives the same poses as `lm` at 200 tracks per image (0.70 px, 3.4× less memory).
+
+Time (seconds), one 24 GB GPU, current pipeline:
+
+| | Ours | GLOMAP + GPS matching |
+|---|---|---|
+| Image loading (512 px, from D:) / feature extraction | 1190 | 3461 |
+| Graph, initial poses, island repair (A + B) | 832 | – |
+| Matching (incl. island check) | 278 | 665 |
+| Rotation averaging, tracks, BA | 48 + 182 + 587 | 4829 (global positioning 2841, BA 963, retriangulation 805) |
+| **Sparse total** | **about 3100 (52 min)** | **8955 (2 h 29 min)** |
+| 20M-point dense cloud | 550–710 | – |
+| Points | 375k BA tracks + 20M dense | 2.60M sparse |
+
+RootSIFT extraction runs on the CPU during A and B. Peak memory: 11 GB GPU in BA, 19 GB GPU during matching, 18 GB RAM (GLOMAP: 48 GB RAM). The GauUscene results above were run before island repair, rotation averaging and the flight offsets; they have not been rerun yet.
+
+```bash
+python scripts/prepare_dji_scene.py --src <DJI photos> --out $SCENE
+python scripts/run_stage_ab.py --scene $SCENE --out $O --sift-cache $O/sift
+python scripts/run_global_ba.py --scene $SCENE --graph-npz $O/graph.npz --out $O/ba --use-gps \
+    --tracks-per-image 800 --sift-cache $O/sift --ba-solver schur
+```
+
 ### Code map (implemented)
 
 | Module | Content |
@@ -243,9 +399,19 @@ python scripts/export_gs_datasets.py --scene $SCENE --ba runs/stage_ab_gps/<scen
 | `fgsfm/proposal/batches.py` | spatial kNN and random batches |
 | `fgsfm/eval/overlap_metrics.py` | Spearman, PR/AP/ROC, relative-pose errors, AUC |
 | `fgsfm/viz/covisibility_viewer.py` | viser viewer (any N×N score matrix) |
+| `fgsfm/graph/islands.py` | island detection and widening search (VGGT batches or SIFT pairs), discard of unlinkable islands |
+| `fgsfm/geometry/rotation_averaging.py` | relative rotations from verified pairs, robust global rotation averaging |
+| `fgsfm/ba/schur.py` | LM step with points eliminated (Schur complement), matrix-free PCG on the camera system |
+| `fgsfm/ba/full_intrinsics.py` | BA model with shared focal + principal point and GPS centre prior; `lm` or `schur` solver |
+| `scripts/egr_graph_stage_b.py` | clustering and cluster merge: GPS fit, per-flight offsets, gimbal prior, island batches |
+| `scripts/prepare_dji_scene.py` | raw DJI photos → undistorted scene folder with GPS, gimbal angles and flights |
+| `scripts/filter_ply.py`, `scripts/view_ply.py` | scale-aware outlier filter; viser viewer for clouds and camera sets |
 
 ### Next
 
+- Rerun the 7 GauUscene scenes with island repair, rotation averaging and Schur BA against their ground truth, and train 3DGS on FeihongBuilding.
+- Loosen the PCG tolerance of the Schur solver (stages 2–3 hit the 1000-iteration cap) and keep LM stage 1 from stopping early when steps are rejected.
+- Image-level weak links: images with few verified pairs, all in their own flight, should get the island search too.
 - Make VGGT densification part of the 3DGS export. Try denser lifting (stride 1–2), a cross-view consistency filter and other point budgets.
 - Harder benchmark: SZTU (1500 images) with RTK GPS, then consumer-grade GPS, then no GPS (time sequence only).
 - [Explicit geometry register](docs/explicit_geometry_register.md): store VGGT-Ω's camera and register tokens of each small batch in its scene-graph node, and merge nodes by running VGGT-Ω's camera head on the stored tokens of several nodes, instead of larger batches or GPS-guided linking. First step: a zero-shot merge test on HAV.

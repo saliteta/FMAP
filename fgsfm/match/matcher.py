@@ -23,7 +23,8 @@ def match_pairs(feats: list[dict], pairs: list[tuple[int, int]], ratio: float = 
                 ransac_px: float = 4.0, min_inliers: int = 30, device: str = "cuda",
                 workers: int = 8) -> dict[tuple[int, int], np.ndarray]:
     """Returns {(i, j): (M, 2) feature index pairs} for geometrically verified pairs."""
-    desc = [torch.as_tensor(f["desc"].astype(np.float32), device=device) for f in feats]
+    need = sorted({i for p in pairs for i in p})         # only the images in these pairs (island searches are small)
+    desc = {i: torch.as_tensor(feats[i]["desc"].astype(np.float32), device=device) for i in need}
     raw = {}
     for i, j in pairs:
         if len(desc[i]) < 2 or len(desc[j]) < 2:

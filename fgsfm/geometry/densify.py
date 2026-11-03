@@ -114,11 +114,18 @@ def voxel_subsample(xyz: np.ndarray, n_max: int, seed: int = 0) -> np.ndarray:
     """Indices of at most n_max points, one per voxel; the voxel size is found by bisection."""
     if len(xyz) <= n_max:
         return np.arange(len(xyz))
-    lo, hi = 1e-4, float(np.ptp(xyz, axis=0).max())
-    for _ in range(30):
+    ext = float(np.ptp(xyz, axis=0).max())
+    lo, hi = max(1e-4, ext / 2e6), ext                 # <= 2e6 cells per axis keeps the 1D key inside int64
+    o = xyz.min(0)
+
+    def keys(p, vs):                                   # one int64 per voxel: 1D unique is much faster than axis=0
+        g = np.floor((p - o) / vs).astype(np.int64)
+        return (g[:, 0] * 2_000_001 + g[:, 1]) * 2_000_001 + g[:, 2]
+
+    for _ in range(20):
         vs = np.sqrt(lo * hi)
-        nv = len(np.unique(np.floor(xyz / vs).astype(np.int64), axis=0))
+        nv = len(np.unique(keys(xyz, vs)))
         lo, hi = (vs, hi) if nv > n_max else (lo, vs)
     perm = np.random.default_rng(seed).permutation(len(xyz))
-    _, first = np.unique(np.floor(xyz[perm] / hi).astype(np.int64), axis=0, return_index=True)
+    _, first = np.unique(keys(xyz[perm], hi), return_index=True)
     return perm[first]

@@ -157,18 +157,111 @@ def place(clusters, n, to_world):
     return w2c, K, src
 
 
-def merge_gps(clusters, n, gps, min_spread=0.1):
+def _angle_deg(Ra, Rb):
+    return np.degrees(np.arccos(np.clip((np.trace(Ra @ np.swapaxes(Rb, -1, -2), axis1=-2, axis2=-1) - 1) / 2, -1, 1)))
+
+
+def fit_gps_gimbal(w2c, G, R_gimbal, keep=0.8, iters=5) -> Sim3:
+    """Sim(3) cluster -> ENU whose rotation comes from the gimbal: every camera gives R = R_gimbal^T R_cluster
+    (apply_w2c: R_world = R_cluster R^T); robust chordal mean, trimming the worst (1-keep). Scale and translation are
+    then fitted to the GPS centres with that rotation fixed, again trimmed."""
+    M = np.einsum("nji,njk->nik", R_gimbal, w2c[:, :3, :3])
+    sel = np.arange(len(M))
+    for _ in range(iters):
+        U, _, Vt = np.linalg.svd(M[sel].sum(0))
+        R = U @ np.diag([1.0, 1.0, np.linalg.det(U @ Vt)]) @ Vt
+        sel = np.argsort(_angle_deg(M, R))[: max(3, int(keep * len(M)))]
+    c = centers(w2c) @ R.T
+    sel = np.arange(len(c))
+    for _ in range(iters):
+        cm, gm = c[sel].mean(0), G[sel].mean(0)
+        sc = float(((c[sel] - cm) * (G[sel] - gm)).sum() / max(((c[sel] - cm) ** 2).sum(), 1e-12))
+        t = gm - sc * cm
+        sel = np.argsort(np.linalg.norm(sc * c + t - G, axis=1))[: max(3, int(keep * len(c)))]
+    return Sim3(sc, R, t)
+
+
+def flight_offsets(clusters, gps, flights, iters=60, min_per_flight=3, log=print):
+    """(F, 3) per-flight GPS offsets b with gps + b[flight] consistent across flights (largest flight: b = 0).
+
+    Each flight is one GPS session; on FeihongBuilding the take-off altitude implied by the photos (absolute minus
+    relative altitude) varies by 17 m between flights, and a cluster fitted to biased GPS puts its cameras and
+    points metres too low. A cluster with >= min_per_flight images from each of two or more flights sees the
+    offsets: fitted to the corrected GPS of all its images, the residual S(C) - gps of a flight's cameras is that
+    flight's offset. Alternate fit and per-flight median until the offsets settle."""
+    F = int(flights.max()) + 1
+    b = np.zeros((F, 3))
+    ref = int(np.argmax(np.bincount(flights)))
+    mixed = []
+    for C in clusters:
+        if C.get("repair"):
+            continue
+        cnt = np.bincount(flights[C["images"]], minlength=F)
+        if (cnt >= min_per_flight).sum() >= 2:
+            mixed.append(C)
+    if not mixed:
+        return b
+    for it in range(iters):
+        res = [[] for _ in range(F)]
+        for C in mixed:
+            im = np.array(C["images"])
+            S = robust_umeyama(centers(C["w2c"]), gps[im] + b[flights[im]])
+            r = S.apply_points(centers(C["w2c"])) - gps[im]
+            for f in np.unique(flights[im]):
+                if (flights[im] == f).sum() >= min_per_flight:
+                    res[f].append(r[flights[im] == f])
+        nb = np.array([np.median(np.concatenate(res[f]), 0) if res[f] else b[f] for f in range(F)])
+        nb -= nb[ref]
+        step = np.abs(nb - b).max()
+        b = nb
+        if step < 0.02:
+            break
+    log(f"merge: per-flight GPS offsets from {len(mixed)} multi-flight clusters ({it + 1} iterations), "
+        f"up: {np.round(b[:, 2], 1).tolist()} m, horizontal max {np.linalg.norm(b[:, :2], axis=1).max():.1f} m")
+    return b
+
+
+def merge_gps(clusters, n, gps, min_spread=0.1, gimbal=None, max_gimbal_deg=5.0, flights=None):
     """Sim(3) of every cluster straight into the GPS (ENU metre) frame: trimmed Umeyama of its camera centres onto
     their GPS positions. No chain, so one bad link cannot carry a block away, and clusters that share no images
     with the rest are placed too. A cluster whose GPS positions are nearly collinear (second singular value below
     min_spread of the first: the roll about the line is unconstrained) is instead fitted to its most-overlapping
-    GPS-placed neighbour by fit_sim3_from_cameras, as in merge()."""
+    GPS-placed neighbour by fit_sim3_from_cameras, as in merge().
+
+    gimbal: optional (n, 3, 3) world-to-camera rotations from the drone's gimbal (fgsfm/io/gps.py gimbal_w2c_for).
+    Positions alone leave the rotation weak for line-like or small clusters (on FeihongBuilding whole ground-level
+    clusters came out rolled by up to 170 deg, internally consistent so BA kept them). With gimbal data a cluster
+    uses fit_gps_gimbal (rotation from the gimbal, scale and offset from GPS) whenever it is collinear or its
+    Umeyama rotation is more than max_gimbal_deg from the gimbal one.
+
+    flights: optional (n,) GPS-session label per image; per-flight GPS offsets (flight_offsets) are removed first."""
+    if flights is not None:
+        gps = gps + flight_offsets(clusters, gps, flights)[flights]
     sets = [set(c["images"]) for c in clusters]
     to_world, links, pending = {}, [], []
     for ci, C in enumerate(clusters):
+        if C.get("repair"):                   # island search batches: placed on the main block below
+            continue
         G = gps[C["images"]]
         sv = np.linalg.svd(G - G.mean(0), compute_uv=False)
-        if sv[1] < min_spread * sv[0]:
+        collinear = sv[1] < min_spread * sv[0]
+        if gimbal is not None:
+            Sg = fit_gps_gimbal(C["w2c"], G, gimbal[C["images"]])
+            if not collinear:
+                S = robust_umeyama(centers(C["w2c"]), G)
+                dis = float(_angle_deg(S.R, Sg.R))
+                if dis <= max_gimbal_deg:
+                    to_world[ci] = S
+                    links.append(dict(child=ci, gps=True, gimbal_disagree_deg=dis))
+                    continue
+            else:
+                dis = None
+            res = np.linalg.norm(Sg.apply_points(centers(C["w2c"])) - G, axis=1)
+            to_world[ci] = Sg
+            links.append(dict(child=ci, gps=True, gimbal=True, collinear=bool(collinear), gimbal_disagree_deg=dis,
+                              res_median=float(np.median(res))))
+            continue
+        if collinear:
             pending.append(ci)
             continue
         S = robust_umeyama(centers(C["w2c"]), G)
@@ -187,6 +280,24 @@ def merge_gps(clusters, n, gps, min_spread=0.1):
         to_world[c] = to_world[p].compose(fit.sim3)
         links.append(dict(parent=p, child=c, gps=False, shared=best[0], inliers=fit.num_inliers))
         pending.remove(c)
+    # island search batches (fgsfm/graph/islands.py): their non-island images are already placed by the main
+    # block, so the batch is fitted to those cameras' full poses (rotation and centre), not to GPS. A batch of
+    # ground-level images along one line constrains rotation as poorly from GPS as the island itself did.
+    repair = [ci for ci, C in enumerate(clusters) if C.get("repair")]
+    if repair:
+        placed, _, _ = place(clusters, n, to_world)
+        for ci in repair:
+            C = clusters[ci]
+            k = [i for i, (g, h) in enumerate(zip(C["images"], C["hops"]))
+                 if h != -1 and np.isfinite(placed[g, 0, 0])]
+            if len(k) < 3:
+                to_world[ci] = robust_umeyama(centers(C["w2c"]), gps[C["images"]])
+                links.append(dict(child=ci, repair=True, anchors=len(k), gps=True))
+                continue
+            fit = fit_sim3_from_cameras(placed[[C["images"][i] for i in k]], C["w2c"][k], None)
+            to_world[ci] = fit.sim3
+            links.append(dict(child=ci, repair=True, anchors=len(k), inliers=fit.num_inliers,
+                              rot_res_median=float(np.median(fit.rot_res_deg))))
     return (*place(clusters, n, to_world), links, len(to_world))
 
 

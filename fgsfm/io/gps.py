@@ -1,4 +1,4 @@
-"""GPS priors: EXIF GPS from a BlocksExchange AT export -> local ENU (meters)."""
+"""GPS priors: EXIF GPS from a BlocksExchange AT export -> local ENU (meters); DJI gimbal orientation priors."""
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
@@ -30,7 +30,11 @@ def geodetic_to_enu(lat, lon, h, lat0=None, lon0=None, h0=None) -> np.ndarray:
 
 
 def read_exif_gps(xml_path: str | Path, cache: str | Path | None = None) -> dict[str, np.ndarray]:
-    """image basename -> (lat, lon, alt) from <Photo><ExifData><GPS>."""
+    """image basename -> (lat, lon, alt) from <Photo><ExifData><GPS>, or from gps.npz next to xml_path when there is
+    no AT export (written by scripts/prepare_dji_scene.py)."""
+    scene_gps = Path(xml_path).parent / "gps.npz"
+    if not Path(xml_path).exists() and scene_gps.exists():
+        cache = scene_gps
     if cache is not None and Path(cache).exists():
         d = np.load(cache)
         return dict(zip(d["names"].tolist(), d["lla"]))
@@ -63,3 +67,44 @@ def gps_enu_for(names: list[str], xml_path: str | Path, cache: str | Path | None
     enu = np.full_like(arr, np.nan)
     enu[ok] = geodetic_to_enu(arr[ok, 0], arr[ok, 1], arr[ok, 2])
     return enu, ok
+
+
+def w2c_rotation_from_gimbal(yaw_deg, pitch_deg) -> np.ndarray:
+    """(n, 3, 3) world-to-camera rotations in ENU from DJI gimbal angles: yaw clockwise from north, pitch < 0 looks
+    down, roll taken as 0 (DJI stabilises it). Camera x right, y down, z forward."""
+    y, p = np.radians(np.asarray(yaw_deg, float)), np.radians(np.asarray(pitch_deg, float))
+    f = np.stack([np.sin(y) * np.cos(p), np.cos(y) * np.cos(p), np.sin(p)], -1)
+    r = np.stack([np.cos(y), -np.sin(y), np.zeros_like(y)], -1)
+    return np.stack([r, np.cross(f, r), f], -2)
+
+
+def gimbal_w2c_for(names: list[str], xml_path: str | Path):
+    """(n, 3, 3) gimbal world-to-camera rotations (ENU) from the scene's gps.npz 'yaw_pitch' (written by
+    scripts/prepare_dji_scene.py), or None when the scene has no gimbal data or an image is missing."""
+    f = Path(xml_path).parent / "gps.npz"
+    if not f.exists():
+        return None
+    d = np.load(f)
+    if "yaw_pitch" not in d.files:
+        return None
+    idx = {n: i for i, n in enumerate(d["names"].tolist())}
+    if any(n not in idx for n in names):
+        return None
+    yp = d["yaw_pitch"][[idx[n] for n in names]]
+    return w2c_rotation_from_gimbal(yp[:, 0], yp[:, 1])
+
+
+def flights_for(names: list[str], xml_path: str | Path):
+    """(n,) int flight label per image from the scene's gps.npz 'flight' (scripts/prepare_dji_scene.py), or None.
+    Each flight is one GPS session; its altitude can be offset by metres from the others."""
+    f = Path(xml_path).parent / "gps.npz"
+    if not f.exists():
+        return None
+    d = np.load(f)
+    if "flight" not in d.files:
+        return None
+    idx = {n: i for i, n in enumerate(d["names"].tolist())}
+    if any(n not in idx for n in names):
+        return None
+    _, lab = np.unique(d["flight"][[idx[n] for n in names]], return_inverse=True)
+    return lab

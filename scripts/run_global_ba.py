@@ -24,16 +24,19 @@ import time
 from pathlib import Path
 
 import numpy as np
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fgsfm.ba.instantsfm_ba import reprojection_errors, run_global_ba
 from fgsfm.eval.pose_metrics import pose_metrics
-from fgsfm.geometry.transforms import centers, robust_umeyama
+from fgsfm.geometry.rotation_averaging import _angle, average_rotations, relative_rotations
+from fgsfm.geometry.transforms import centers, make_w2c, robust_umeyama
 from fgsfm.graph.view_graph import ViewGraph
 from fgsfm.io.colmap_text import ColmapModel
 from fgsfm.io.gps import gps_enu_for
 from fgsfm.io.scene import load_reference_scene
+from fgsfm.graph.islands import repair
 from fgsfm.match.matcher import match_pairs
 from fgsfm.match.sift import extract_features
 from fgsfm.match.tracks import build_tracks, subset, triangulate
@@ -66,6 +69,8 @@ class NpzGraph:
             self.depth = [x.reshape(-1).astype(np.float64) if o else None for x, o in zip(d["depth4"], ok)]
             self.depth_valid = [x.reshape(-1) if o else None for x, o in zip(d["valid4"], ok)]
         self._cams = np.flatnonzero(np.isfinite(self.w2c[:, 0, 0]))
+        n = len(self.names)                                 # pairs found by the island search (run_stage_ab.py)
+        self.bridge = d["bridge"] if "bridge" in d else np.zeros((n, n), bool)
 
     def cams_in(self, frame):
         return self._cams
@@ -104,6 +109,8 @@ def main():
     ap.add_argument("--min-track-len", type=int, default=3,
                     help="drop tracks seen in fewer images (default 3: no 2-view tracks; BA 5x faster, same accuracy)")
     ap.add_argument("--ba-ftol", type=float, default=5e-4, help="LM relative-improvement stopping tolerance")
+    ap.add_argument("--ba-solver", choices=("lm", "schur"), default="lm",
+                    help="lm: bae LM on the full J^T J; schur: points eliminated, matrix-free PCG (fgsfm/ba/schur.py)")
     ap.add_argument("--ba-max-iters", type=int, default=100, help="LM iteration cap per BA stage")
     ap.add_argument("--intrinsics", choices=("focal", "focal+pp", "shared_f+pp"), default="shared_f+pp",
                     help="intrinsics BA optimizes: shared_f+pp (default: one focal + principal point); "
@@ -111,6 +118,12 @@ def main():
     ap.add_argument("--init-from-ref", choices=("none", "poses", "poses+K"), default="none",
                     help="diagnostic: start BA from the reference (Bentley AT) poses [and intrinsics, principal point "
                          "included]; tracks are re-triangulated from the cached matches")
+    ap.add_argument("--no-island-repair", action="store_true", help="skip the island search on the verified pairs")
+    ap.add_argument("--no-rotation-averaging", action="store_true",
+                    help="keep the stage-B rotations (default: robust rotation averaging over the verified pairs)")
+    ap.add_argument("--island-step", type=int, default=40, help="candidate images matched per island search step")
+    ap.add_argument("--bridge-min-inliers", type=int, default=15,
+                    help="inlier floor for island search pairs (ground-to-air pairs are weak; normal pairs need 30)")
     ap.add_argument("--tracks-cache", type=Path, default=None, help="reuse matches/tracks from another run's pickle")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -120,7 +133,8 @@ def main():
     # ---- reference (evaluation only) + graph checkpoint
     try:
         ref = load_reference_scene(args.scene).graph.cameras
-    except ValueError:                 # points3D.ply is not the AT tie points (e.g. CUHK_LOWER); poses suffice here
+    except (ValueError, FileNotFoundError):   # points3D.ply is not the AT tie points (e.g. CUHK_LOWER), or no AT
+                                              # export at all (e.g. a GPS + gimbal pseudo-reference); poses suffice here
         ref = ViewGraph.from_colmap(ColmapModel.load(args.scene / "sparse" / "0")).cameras
     names = [c.name for c in ref]
     if args.ckpt is not None:
@@ -181,6 +195,7 @@ def main():
         nn = np.argsort(-Sc, axis=1)[:, :args.topk]
         E[np.repeat(np.arange(len(Sc)), args.topk), nn.ravel()] = True
         E &= Sc >= args.topk_min_overlap
+        E |= getattr(g, "bridge", np.zeros((len(names),) * 2, bool))[np.ix_(cams, cams)]   # island search pairs
         E |= E.T
     else:
         E = Sc >= args.pair_overlap
@@ -189,11 +204,24 @@ def main():
         ("" if args.features == "sift" else f"_{args.features}_r{args.ratio}") + \
         (f"_guided{args.guide_radius:.0f}" if args.guided else "")
     cache = args.tracks_cache or args.out / f"tracks_w{args.match_width}_n{args.max_features}_{pair_tag}.pkl"
+    def rotation_averaging(w2c, matches):
+        """Rotations from all verified pairs at once (fgsfm/geometry/rotation_averaging.py); centres kept."""
+        t = time.time()
+        pr, Rij, ninl = relative_rotations(matches, feats, K0)
+        Rn = average_rotations(w2c[:, :3, :3], pr, Rij, np.minimum(ninl, 200) / 200.0)
+        ch = np.degrees(_angle(Rn @ np.transpose(w2c[:, :3, :3], (0, 2, 1))))
+        T["rotation_averaging_s"] = time.time() - t
+        print(f"rotation averaging: {len(pr)} pairs; cameras changed > 2 deg: {(ch > 2).sum()}, > 5 deg: {(ch > 5).sum()}, "
+              f"> 20 deg: {(ch > 20).sum()}, max {ch.max():.1f} deg ({T['rotation_averaging_s']:.0f}s)", flush=True)
+        return make_w2c(Rn, centers(w2c))
+
     if cache.exists():
         with open(cache, "rb") as f:
             c = pickle.load(f)
         matches, tracks = c["matches"], c["tracks"]
-        if args.init_from_ref != "none":
+        if args.init_from_ref == "none" and not args.no_rotation_averaging:
+            w2c0 = rotation_averaging(w2c0, matches)
+        if args.init_from_ref != "none" or not args.no_rotation_averaging:
             tracks = build_tracks(matches, [len(f["xy"]) for f in feats])
             tracks = subset(tracks, triangulate(tracks, feats, w2c0, K0, args.init_reproj_px))
         print(f"loaded cached matches/tracks from {cache}", flush=True)
@@ -221,9 +249,33 @@ def main():
                   f"{gstats['fallback']} more from fallback", flush=True)
         else:
             matches = match_pairs(feats, pairs, ratio=args.ratio)
+        torch.cuda.empty_cache()           # the matcher keeps every image's descriptors on the GPU (~16 GB at 3.7k)
+        if not args.no_island_repair:      # no islands in the verified-pair graph either (fgsfm/graph/islands.py)
+            nc = len(cams)
+            A = np.zeros((nc, nc), bool)
+            for i, j in matches:
+                A[i, j] = A[j, i] = True
+            pos = gps[cams] if args.use_gps else centers(w2c0)
+
+            def search(part, cand):
+                new = match_pairs(feats, [(int(min(a, b)), int(max(a, b))) for a in part for b in cand],
+                                  ratio=args.ratio, min_inliers=args.bridge_min_inliers)
+                for (i, j), m in new.items():
+                    matches[(i, j)] = m
+                    A[i, j] = A[j, i] = True
+                torch.cuda.empty_cache()
+                return A
+
+            _, gone, rep = repair(A, pos, search, step=args.island_step)
+            if gone.any():
+                matches = {k: v for k, v in matches.items() if not (gone[k[0]] or gone[k[1]])}
+                print(f"discarded {int(gone.sum())} images in unlinked islands (no matches kept)", flush=True)
+            T["islands"] = rep
         T["matching_s"] = time.time() - t
         print(f"pairs: {len(pairs)} graph edges -> {len(matches)} verified "
               f"(median {int(np.median([len(v) for v in matches.values()]))} inliers) ({T['matching_s']:.0f}s)", flush=True)
+        if args.init_from_ref == "none" and not args.no_rotation_averaging:
+            w2c0 = rotation_averaging(w2c0, matches)
         # ---- tracks + triangulation from the initial poses
         t = time.time()
         tracks = build_tracks(matches, [len(f["xy"]) for f in feats])
@@ -260,7 +312,7 @@ def main():
     t = time.time()
     out = run_global_ba(w2c0, K0, (W, H), tracks, feats, tuple(float(x) for x in args.filter_px.split(",")),
                         options=dict(optimize_intrinsics=not args.fix_intrinsics, function_tolerance=args.ba_ftol,
-                                     max_num_iterations=args.ba_max_iters), intrinsics_mode=args.intrinsics,
+                                     max_num_iterations=args.ba_max_iters, solver=args.ba_solver), intrinsics_mode=args.intrinsics,
                         center_prior=gps_ba, prior_sigma=args.gps_prior_sigma if args.gps_prior_sigma > 0 else 0.05)
     T["ba_s"] = time.time() - t
     after = pose_metrics(out.w2c, w2c_ref)

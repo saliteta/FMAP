@@ -78,6 +78,7 @@ def load_images(root: Path, names, cache_dir: Path):
         chunks.append(load_and_preprocess_images([str(root / "images" / n) for n in names[s:s + 64]],
                                                  image_resolution=512).to(torch.float16))
     x = torch.cat(chunks)
+    cache.parent.mkdir(parents=True, exist_ok=True)
     torch.save(x, cache)
     return x
 

@@ -9,7 +9,7 @@ A camera file is a JSON list of {name, w2c (4x4), fx, fy, cx, cy, width, height,
 camera's colour (frame 0 black); the first camera set is drawn solid, the others as thinner frustums. With two
 camera sets, the panel lists per camera the rotation difference and the camera-centre distance between them.
 Panel: a checkbox per cloud and per camera set, point size, frustum size, up axis (VGGT-Omega's frame-0 camera
-frame has +y pointing down).
+frame has +y pointing down; --up +z for ENU scenes), --max-points to subsample large clouds for the browser.
 """
 from __future__ import annotations
 
@@ -41,14 +41,19 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--point-size", type=float, default=0.001)
     ap.add_argument("--frustum-scale", type=float, default=0.02)
+    ap.add_argument("--up", choices=("-y", "+y", "+z", "-z"), default="-y", help="+z for ENU (run_global_ba.py)")
+    ap.add_argument("--max-points", type=int, default=0, help="random subset per cloud for a smooth browser (0 = all)")
     args = ap.parse_args()
     server = viser.ViserServer(port=args.port)
-    server.scene.set_up_direction("-y")
+    server.scene.set_up_direction(args.up)
 
     clouds = {}
     for spec in args.clouds:
         name, path = spec.split("=", 1)
         xyz, rgb = read_ply(Path(path))
+        if 0 < args.max_points < len(xyz):
+            sel = np.random.default_rng(0).choice(len(xyz), args.max_points, replace=False)
+            xyz, rgb = xyz[sel], rgb[sel]
         clouds[name] = server.scene.add_point_cloud(f"/clouds/{name}", points=xyz, colors=rgb,
                                                     point_size=args.point_size)
         print(f"{name}: {len(xyz)} points from {path}", flush=True)
@@ -84,7 +89,8 @@ def main():
                 def _(event, handles=handles):
                     for h in handles:
                         h.visible = event.target.value
-            fs = server.gui.add_slider("frustum size", min=0.002, max=0.1, step=0.001,
+            fs = server.gui.add_slider("frustum size", min=args.frustum_scale / 10, max=args.frustum_scale * 5,
+                                       step=args.frustum_scale / 10,
                                        initial_value=args.frustum_scale)
 
             @fs.on_update
@@ -92,13 +98,14 @@ def main():
                 for _, handles in cam_sets.values():
                     for h in handles:
                         h.scale = fs.value
-    size = server.gui.add_slider("point size", min=0.0001, max=0.005, step=0.0001, initial_value=args.point_size)
+    size = server.gui.add_slider("point size", min=args.point_size / 10, max=max(0.005, args.point_size * 5),
+                                 step=args.point_size / 10, initial_value=args.point_size)
 
     @size.on_update
     def _(_):
         for h in clouds.values():
             h.point_size = size.value
-    up = server.gui.add_dropdown("up axis", options=("-y", "+y", "+z", "-z"), initial_value="-y")
+    up = server.gui.add_dropdown("up axis", options=("-y", "+y", "+z", "-z"), initial_value=args.up)
 
     @up.on_update
     def _(_):

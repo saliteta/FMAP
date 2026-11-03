@@ -86,8 +86,12 @@ def solve_full_intrinsics(cameras, images, tracks, options: dict, mode: str = "f
         project = _project_fxfycxcy
     model = FullIntrinsicsReprojection(image_extrs, intr, points_3d, project)
     strategy = pp.optim.strategy.TrustRegion(radius=1e4, max=1e10, up=2.0, down=0.5 ** 4)
-    optimizer = LM(model, strategy=strategy, solver=PCG(tol=1e-5), kernel=Huber(options["thres_loss_function"]),
-                   reject=30)
+    if options.get("solver", "lm") == "schur":                 # points eliminated, matrix-free (fgsfm/ba/schur.py)
+        from fgsfm.ba.schur import SchurLM
+        optimizer = SchurLM(model, strategy=strategy, kernel=Huber(options["thres_loss_function"]), reject=30)
+    else:
+        optimizer = LM(model, strategy=strategy, solver=PCG(tol=1e-5), kernel=Huber(options["thres_loss_function"]),
+                       reject=30)
     inputs = dict(points_2d=points_2d, image_indices=image_indices, camera_indices=camera_indices,
                   point_indices=point_indices)
     if center_prior is not None:
@@ -106,6 +110,10 @@ def solve_full_intrinsics(cameras, images, tracks, options: dict, mode: str = "f
             prev, recent = np.mean(hist[-8:-4]), np.mean(hist[-4:])
             if abs(prev - recent) / max(prev, 1e-12) < options["function_tolerance"] or hist[-1] == hist[-2]:
                 break
+    cg = getattr(optimizer, "cg_iters", None)
+    print(f"    LM {len(hist)} iterations, loss {hist[0]:.6g} -> {hist[-1]:.6g}"
+          + (f", PCG iterations per solve median {int(np.median(cg))} max {max(cg)} ({len(cg)} solves)" if cg else ""),
+          flush=True)
     with torch.no_grad():
         tracks.xyzs[:] = model.points_3d.detach().cpu().numpy()
         E = pp.SE3(model.extrinsics.detach()).matrix().cpu().numpy()
